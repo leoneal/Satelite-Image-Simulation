@@ -306,9 +306,12 @@ def setup_stars(camera):
     img = bpy.data.images.load(tex_path)
     tex = nodes.new('ShaderNodeTexImage')
     tex.image = img
-    # Use Window coordinates so texture stays fixed relative to frame
+    # Window coordinates + Mapping to rotate stars as camera turns (celestial fix)
     coord = nodes.new('ShaderNodeTexCoord')
-    links.new(coord.outputs['Window'], tex.inputs['Vector'])
+    mapping = nodes.new('ShaderNodeMapping')
+    mapping.inputs['Location'].default_value = (0.0, 0.0, 0.0)
+    links.new(coord.outputs['Window'], mapping.inputs['Vector'])
+    links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
 
     emit = nodes.new('ShaderNodeEmission')
     emit.inputs['Strength'].default_value = 1.0
@@ -317,7 +320,11 @@ def setup_stars(camera):
     links.new(emit.outputs['Emission'], out.inputs['Surface'])
     plane.data.materials.append(mat)
 
-    print('  Stars: backdrop plane with 8K texture')
+    # Store references for per-frame rotation compensation
+    setup_stars.mapping_node = mapping
+    setup_stars.ref_matrix = None  # set on first update_frame
+
+    print('  Stars: backdrop plane with celestial-rotation compensation')
 
 
 def setup_render(samples):
@@ -380,6 +387,21 @@ def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_ta
         (x_axis.z, y_axis.z, z_axis.z)
     )).to_4x4()
     camera.matrix_world = Matrix.Translation(obs_pos) @ rot
+
+    # --- Starfield rotation compensation (celestial fix) ---
+    if hasattr(setup_stars, 'mapping_node') and hasattr(setup_stars, 'ref_matrix'):
+        mapping = setup_stars.mapping_node
+        if setup_stars.ref_matrix is None:
+            # First frame: capture reference camera orientation
+            setup_stars.ref_matrix = rot.copy()
+        else:
+            # Compute delta rotation from reference: R_delta = R_ref^T * R_curr
+            R_delta = setup_stars.ref_matrix.inverted() @ rot
+            # Apply INVERSE to mapping so stars stay fixed in ECI
+            R_comp = R_delta.inverted()
+            # Convert 4x4 to 3x3 rotation, extract Euler (radians, ZYX order for Mapping node)
+            euler = R_comp.to_3x3().to_euler('XYZ')
+            mapping.inputs['Rotation'].default_value = (euler.x, euler.y, euler.z)
 
     # Satellite parts: move all to target position + rotate
     # Store initial offsets on first call

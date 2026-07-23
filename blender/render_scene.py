@@ -97,7 +97,7 @@ def clear_scene():
 
 
 def create_earth():
-    """Create Earth sphere with basic material"""
+    """Create Earth sphere with Blue Marble texture (fallback to solid blue if not found)."""
     bpy.ops.mesh.primitive_uv_sphere_add(
         radius=EARTH_RADIUS,
         location=(0, 0, 0),
@@ -106,19 +106,37 @@ def create_earth():
     earth = bpy.context.active_object
     earth.name = 'Earth'
 
-    # Create basic earth material (blue with slight atmosphere)
     mat = bpy.data.materials.new('EarthMaterial')
     nodes = mat.node_tree.nodes
     nodes.clear()
 
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-    bsdf.inputs['Base Color'].default_value = (0.1, 0.2, 0.5, 1.0)  # Ocean blue
-    bsdf.inputs['Roughness'].default_value = 0.7
+    # Try to load 8K Earth texture
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tex_path = os.path.join(project_root, 'data', 'earth_textures', '8k_earth_daymap.jpg')
 
-    output = nodes.new('ShaderNodeOutputMaterial')
-    mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    if os.path.exists(tex_path):
+        # Textured Earth
+        img_tex = nodes.new('ShaderNodeTexImage')
+        img = bpy.data.images.load(tex_path)
+        img_tex.image = img
+        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.inputs['Roughness'].default_value = 0.7
+        nodes.new('ShaderNodeTexCoord')
+        nodes.active = None  # not needed, just connect
+        output = nodes.new('ShaderNodeOutputMaterial')
+        mat.node_tree.links.new(img_tex.outputs['Color'], bsdf.inputs['Base Color'])
+        mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+        print('  Earth: 8K textured')
+    else:
+        # Fallback: solid blue
+        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.inputs['Base Color'].default_value = (0.1, 0.2, 0.5, 1.0)
+        bsdf.inputs['Roughness'].default_value = 0.7
+        output = nodes.new('ShaderNodeOutputMaterial')
+        mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+        print(f'  Earth: solid blue (texture not found at {tex_path})')
+
     earth.data.materials.append(mat)
-
     return earth
 
 
@@ -244,19 +262,20 @@ def setup_sun():
 
 
 def setup_stars():
-    """Add starfield background"""
-    # Use world shader with stars
+    """Deep space background (starfield deferred to future work).
+    Uses a subtle dark blue-black world color.
+    """
     world = bpy.context.scene.world
     nodes = world.node_tree.nodes
+    links = world.node_tree.links
     nodes.clear()
 
-    # Background color (deep space black)
     bg = nodes.new('ShaderNodeBackground')
     bg.inputs['Color'].default_value = (0.001, 0.001, 0.005, 1.0)
     bg.inputs['Strength'].default_value = 1.0
 
-    output = nodes.new('ShaderNodeOutputWorld')
-    world.node_tree.links.new(bg.outputs['Background'], output.inputs['Surface'])
+    out_w = nodes.new('ShaderNodeOutputWorld')
+    links.new(bg.outputs['Background'], out_w.inputs['Surface'])
 
 
 def setup_render(samples):

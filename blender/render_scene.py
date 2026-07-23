@@ -261,21 +261,63 @@ def setup_sun():
     return sun, sun_target
 
 
-def setup_stars():
-    """Deep space background (starfield deferred to future work).
-    Uses a subtle dark blue-black world color.
+def setup_stars(camera):
+    """Starfield via emissive plane parented to camera (works around world shader bugs).
+    A large textured plane is placed in front of the camera, acting as a backdrop.
     """
+    # World: pure black
     world = bpy.context.scene.world
-    nodes = world.node_tree.nodes
-    links = world.node_tree.links
+    nodes_w = world.node_tree.nodes
+    links_w = world.node_tree.links
+    nodes_w.clear()
+    bg = nodes_w.new('ShaderNodeBackground')
+    bg.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+    bg.inputs['Strength'].default_value = 1.0
+    out_w = nodes_w.new('ShaderNodeOutputWorld')
+    links_w.new(bg.outputs['Background'], out_w.inputs['Surface'])
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tex_path = os.path.join(project_root, 'data', 'star_bg', '8k_stars.jpg')
+
+    if not os.path.exists(tex_path):
+        print(f'  Stars: fallback dark (no texture at {tex_path})')
+        return
+
+    # Create backdrop plane far behind any possible satellite distance
+    # Camera looks along -Z. 100000 km ensures plane is always behind satellite.
+    BACKDROP_DIST = 100000.0  # km, well beyond max satellite distance (~16300 km)
+    # Plane size to fill 0.117 deg FOV at this distance
+    import math as m
+    half_fov = m.radians(0.117 / 2)  # half FOV in radians
+    plane_size = 2.0 * BACKDROP_DIST * m.tan(half_fov) * 2.5  # 2.5x margin
+    bpy.ops.mesh.primitive_plane_add(size=plane_size, location=(0, 0, -BACKDROP_DIST))
+    plane = bpy.context.active_object
+    plane.name = 'StarBackdrop'
+
+    # Parent to camera so it follows
+    plane.parent = camera
+
+    # Emission material with star texture
+    mat = bpy.data.materials.new('StarBackdropMat')
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
     nodes.clear()
 
-    bg = nodes.new('ShaderNodeBackground')
-    bg.inputs['Color'].default_value = (0.001, 0.001, 0.005, 1.0)
-    bg.inputs['Strength'].default_value = 1.0
+    img = bpy.data.images.load(tex_path)
+    tex = nodes.new('ShaderNodeTexImage')
+    tex.image = img
+    # Use Window coordinates so texture stays fixed relative to frame
+    coord = nodes.new('ShaderNodeTexCoord')
+    links.new(coord.outputs['Window'], tex.inputs['Vector'])
 
-    out_w = nodes.new('ShaderNodeOutputWorld')
-    links.new(bg.outputs['Background'], out_w.inputs['Surface'])
+    emit = nodes.new('ShaderNodeEmission')
+    emit.inputs['Strength'].default_value = 1.0
+    links.new(tex.outputs['Color'], emit.inputs['Color'])
+    out = nodes.new('ShaderNodeOutputMaterial')
+    links.new(emit.outputs['Emission'], out.inputs['Surface'])
+    plane.data.materials.append(mat)
+
+    print('  Stars: backdrop plane with 8K texture')
 
 
 def setup_render(samples):
@@ -626,7 +668,7 @@ def main():
     sat_parts = create_satellite_model()
     camera = setup_camera(fov_deg, resolution)
     sun_light, sun_target = setup_sun()
-    setup_stars()
+    setup_stars(camera)
     setup_render(samples)
 
     bpy.context.scene.camera = camera

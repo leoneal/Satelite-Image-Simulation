@@ -1,0 +1,45 @@
+# Blender renders and heavy output
+output/images/
+output/annotations/
+output/ephemeris/
+output/video/
+output/stk_sample_images/
+output/access_reports/
+output/validation_batch_stride300/
+output/pilot_batch_50f/
+output/survey_batch_stride60/
+output/early_tests/
+output/*.blend
+output/*.blend1
+
+# Temp and cache
+*.pyc
+__pycache__/
+*.tmp
+*.exr
+~$*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# STK lock files
+*.lock
+
+# Debug temp files
+config/_verify_utf8.txt
+# Claude project files
+.agents/
+.claude/
+
+# Large docs (reference only)
+*.pdf
+*.docx
+skills-lock.json
+# Project root docs (Chinese filenames)
+提示词.txt
+给钱室（公开）.xlsx

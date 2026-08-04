@@ -41,7 +41,7 @@ def kepler2cart(a, e, inc, raan, argp, nu):
 def dist(a, b):
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
-wb = openpyxl.load_workbook(r'F:\钱室\卫星图像仿真\给钱室（公开）.xlsx', read_only=True, data_only=True)
+wb = openpyxl.load_workbook(r'~/project/orbit_data_public.xlsx', read_only=True, data_only=True)
 ws = wb['Sheet1']
 
 # Sample rows: start, a few mid, closest approach, end
@@ -51,7 +51,7 @@ for row in ws.iter_rows(min_row=2, values_only=True):
     pass  # need index; simpler: collect all then sample
 
 wb.close()
-wb = openpyxl.load_workbook(r'F:\钱室\卫星图像仿真\给钱室（公开）.xlsx', read_only=True, data_only=True)
+wb = openpyxl.load_workbook(r'~/project/orbit_data_public.xlsx', read_only=True, data_only=True)
 ws = wb['Sheet1']
 all_rows = list(ws.iter_rows(min_row=2, values_only=True))
 wb.close()

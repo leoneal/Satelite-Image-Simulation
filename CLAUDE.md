@@ -16,7 +16,7 @@
 | STK MATLAB API | `E:\STK_11.6\bin\Matlab`（.m 包装函数）+ `E:\STK_11.6\bin`（.mexw64 二进制，**两个目录都必须 addpath**） |
 | MATLAB | `E:\matlab\` |
 | Blender 5.2 | `E:\Blender\blender.exe` |
-| 项目根 | `F:\钱室\卫星图像仿真\` |
+| 项目根 | `~/project/` |
 | 工况数据 | `orbit_data.xlsx`（34201 行瞬时根数，1 秒/行，a 单位米，角度单位弧度；原始中文名文件已复制为此 ASCII 名，**MATLAB 代码引用文件一律用 ASCII 名**，GBK 环境下中文路径会乱码） |
 
 ## 目录结构
@@ -160,8 +160,8 @@ earth.location = -obs_pos          # 地球在 ~42164 km（精度需求低）
 
 ### segB 核心段（DSP 模型，track，窄视场）
 ```powershell
-& "E:\Blender\blender.exe" -b -P "F:\钱室\卫星图像仿真\blender\render_scene.py" -- `
-  --ephem_dir "F:\钱室\卫星图像仿真\output\ephemeris" `
+& "E:\Blender\blender.exe" -b -P "~/project/blender\render_scene.py" -- `
+  --ephem_dir "~/project/output\ephemeris" `
   --start 23165 --end 23609 --stride 1 `
   --samples 64 --resolution 2048 --fov 0.08 `
   --camera_mode track --model_type dsp_blend `
@@ -170,8 +170,8 @@ earth.location = -obs_pos          # 地球在 ~42164 km（精度需求低）
 
 ### segA/segC 远距段（DSP 模型 ×10，stare，宽视场）
 ```powershell
-& "E:\Blender\blender.exe" -b -P "F:\钱室\卫星图像仿真\blender\render_scene.py" -- `
-  --ephem_dir "F:\钱室\卫星图像仿真\output\ephemeris" `
+& "E:\Blender\blender.exe" -b -P "~/project/blender\render_scene.py" -- `
+  --ephem_dir "~/project/output\ephemeris" `
   --start 22482 --end 23166 --stride 25 `
   --samples 32 --resolution 2048 --fov 14 `
   --camera_mode stare --model_scale 10.0 `
@@ -181,8 +181,8 @@ earth.location = -obs_pos          # 地球在 ~42164 km（精度需求低）
 
 ### 手搭简易模型
 ```powershell
-& "E:\Blender\blender.exe" -b -P "F:\钱室\卫星图像仿真\blender\render_scene.py" -- `
-  --ephem_dir "F:\钱室\卫星图像仿真\output\ephemeris" `
+& "E:\Blender\blender.exe" -b -P "~/project/blender\render_scene.py" -- `
+  --ephem_dir "~/project/output\ephemeris" `
   --start 23165 --end 23609 --stride 1 `
   --samples 64 --resolution 2048 --fov 0.08 `
   --camera_mode track --model_type simple `
@@ -192,6 +192,6 @@ earth.location = -obs_pos          # 地球在 ~42164 km（精度需求低）
 ### MATLAB 主入口
 ```matlab
 % MATLAB 主入口（STK 会被脚本自动启动）
-cd 'F:\钱室\卫星图像仿真\matlab'
+cd '~/project/matlab'
 main
 ```

@@ -214,7 +214,7 @@ stkConnect(conid, 'VO_3DView Snapshot', 'screenshot.png');
 完成手动操作后，运行 MATLAB 测试脚本验证自动化连接：
 
 ```matlab
-cd 'F:\钱室\卫星图像仿真\matlab'
+cd '~/project/matlab'
 test_stk_connection
 ```
 

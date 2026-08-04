@@ -47,6 +47,10 @@ def parse_args():
     parser.add_argument('--batch_offset', type=int, default=0, help='Batch offset multiplier')
     parser.add_argument('--tag', type=str, default=None,
                         help='Batch tag for output subfolder naming (default: auto from start/end)')
+    parser.add_argument('--camera_mode', type=str, default='track',
+                        choices=['track', 'stare'],
+                        help='track: camera follows target; stare: fixed ECI boresight')
+    parser.add_argument('--fov', type=float, default=0.117, help='Camera FOV in degrees')
     parser.add_argument('--no_annotations', action='store_true', help='Skip mask/COCO/YOLO/pose generation')
     return parser.parse_args(argv)
 
@@ -85,9 +89,13 @@ def load_all_data(ephem_dir):
 # Scene setup
 # ============================================================
 
-KM_SCALE = 0.001  # Convert meters to km for Blender scene
-SAT_MODEL_SCALE = 1.0  # Realistic scale (meters)
-EARTH_RADIUS = 6371.0  # km
+KM_SCALE = 0.001       # Convert meters to km for Blender scene
+EARTH_RADIUS = 6371.0   # km
+
+# FBX models may have an inherent rotation (modeling convention artifact).
+# This quaternion is captured during loading and compensated in update_frame
+# so that tgt_quat (satellite attitude) applies cleanly without double-rotation.
+_fbx_model_rot_inv = Quaternion((1, 0, 0, 0))  # identity = no compensation
 
 
 def clear_scene():
@@ -110,25 +118,21 @@ def create_earth():
     nodes = mat.node_tree.nodes
     nodes.clear()
 
-    # Try to load 8K Earth texture
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     tex_path = os.path.join(project_root, 'data', 'earth_textures', '8k_earth_daymap.jpg')
 
     if os.path.exists(tex_path):
-        # Textured Earth
         img_tex = nodes.new('ShaderNodeTexImage')
         img = bpy.data.images.load(tex_path)
         img_tex.image = img
         bsdf = nodes.new('ShaderNodeBsdfPrincipled')
         bsdf.inputs['Roughness'].default_value = 0.7
         nodes.new('ShaderNodeTexCoord')
-        nodes.active = None  # not needed, just connect
         output = nodes.new('ShaderNodeOutputMaterial')
         mat.node_tree.links.new(img_tex.outputs['Color'], bsdf.inputs['Base Color'])
         mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
         print('  Earth: 8K textured')
     else:
-        # Fallback: solid blue
         bsdf = nodes.new('ShaderNodeBsdfPrincipled')
         bsdf.inputs['Base Color'].default_value = (0.1, 0.2, 0.5, 1.0)
         bsdf.inputs['Roughness'].default_value = 0.7
@@ -140,118 +144,402 @@ def create_earth():
     return earth
 
 
+# ============================================================
+# Satellite model loading — unified pipeline with correct transform baking
+# ============================================================
+#
+# Every loading path follows the same rules (from CLAUDE.md lessons learned):
+#   1. Import/load geometry
+#   2. Remove non-mesh objects (cameras, lights, empties)
+#   3. Unparent meshes (CLEAR_KEEP_TRANSFORM preserves world positions)
+#   4. Bake ALL transforms → identity (location, rotation, scale)
+#   5. Center geometry at origin (shift vertices so geometric center = origin)
+#   6. Scale vertex data to km, apply
+#   7. Assign emission+BSDF mix material (NOT 100% emission — kills 3D detail)
+#   8. Return flat list of independent meshes with identity transforms
+#
+# The key fixes vs the old code:
+#   - transform_apply(location=True, rotation=True, scale=True) on EVERY mesh
+#   - Centering: model center maps to origin → update_frame places center at tgt_pos
+#   - Materials: 40% emission + 60% BSDF (was 100% emission — made all surfaces
+#     look like flat colored silhouettes with zero depth cues)
+#   - No parent-child hierarchy → flat list, no hidden transform compounding
+
+# Color+emission presets by component type (also used by _build_simple_model)
+COMPONENT_COLORS = {
+    'body':    (0.70, 0.70, 0.70),   # grey
+    'panel':   (0.10, 0.20, 0.55),   # blue solar panel
+    'phased':  (0.92, 0.90, 0.80),   # cream/light yellow
+    'reflector': (0.88, 0.87, 0.92), # light silver
+    'tripod':  (0.60, 0.50, 0.40),   # bronze
+    'default': (0.65, 0.65, 0.68),   # neutral grey
+}
+
+
+def _classify_part(obj):
+    """Return (component_type, pass_index_base) from object name.
+    component_type is one of: 'body', 'panel', 'phased', 'reflector', 'tripod', 'default'
+    """
+    name = obj.name.lower()
+    if name.startswith('panel') or 'solar' in name:
+        return 'panel', 2
+    elif 'phased' in name or 'array' in name:
+        return 'phased', 100
+    elif 'reflector' in name or 'dish' in name:
+        return 'reflector', 150
+    elif 'tripod' in name or 'truss' in name:
+        return 'tripod', 200
+    elif name.startswith('body') or name.startswith('satellite') or 'bus' in name:
+        return 'body', 1
+    else:
+        return 'default', 1
+
+
+def _add_component_material(obj, comp_type):
+    """
+    Add emission+BSDF material to a mesh. 40% emission + 60% BSDF gives:
+    - Self-illumination so the satellite is visible against black space
+    - Directional shading so surface orientation is visible (3D depth cue)
+    - Sun lamp provides additional directional lighting on the BSDF component
+    """
+    mat = bpy.data.materials.new(obj.name + '_mat')
+    nodes = mat.node_tree.nodes
+    nodes.clear()
+
+    color = COMPONENT_COLORS.get(comp_type, COMPONENT_COLORS['default'])
+
+    emit = nodes.new('ShaderNodeEmission')
+    emit.inputs['Color'].default_value = (*color, 1.0)
+    emit.inputs['Strength'].default_value = 3.0  # Bright enough for space, won't saturate
+
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Base Color'].default_value = (*color, 1.0)
+    bsdf.inputs['Roughness'].default_value = 0.4
+    bsdf.inputs['Metallic'].default_value = 0.3
+
+    mix = nodes.new('ShaderNodeMixShader')
+    mix.inputs['Fac'].default_value = 0.85  # 85% emission, 15% BSDF for subtle surface detail
+
+    output = nodes.new('ShaderNodeOutputMaterial')
+    mat.node_tree.links.new(emit.outputs['Emission'], mix.inputs[1])
+    mat.node_tree.links.new(bsdf.outputs['BSDF'], mix.inputs[2])
+    mat.node_tree.links.new(mix.outputs['Shader'], output.inputs['Surface'])
+
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+
+
+def _bake_transform(obj):
+    """Fully bake an object's transform into its mesh vertex data.
+    After this call: obj.location=(0,0,0), obj.scale=(1,1,1), obj.rotation_quaternion=identity.
+    """
+    obj.select_set(False)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    obj.select_set(False)
+
+
+def _unparent_meshes(meshes):
+    """Unparent all meshes, preserving world positions via CLEAR_KEEP_TRANSFORM."""
+    for obj in meshes:
+        if obj.parent:
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
+            obj.select_set(False)
+
+
+def _center_and_scale_to_km(meshes):
+    """
+    Compute geometric center of all mesh vertices, shift so center → origin,
+    then scale all vertex data by KM_SCALE.
+
+    After this: all meshes have identity transforms, vertices in km units,
+    model geometric center at origin.
+    """
+    if not meshes:
+        return
+
+    # Compute geometric center (average of all vertex positions in world space)
+    all_verts = []
+    for obj in meshes:
+        mw = obj.matrix_world
+        for v in obj.data.vertices:
+            all_verts.append(mw @ v.co)
+    center = sum(all_verts, Vector((0, 0, 0))) / len(all_verts)
+
+    # Build transform: translate center → origin, then scale to km
+    # Order: Translation(-center) applied first, then Scale(KM)
+    to_km = Matrix.Scale(KM_SCALE, 4) @ Matrix.Translation(-center)
+
+    for obj in meshes:
+        obj.data.transform(to_km)
+
+    # Measure and report
+    all_v = []
+    for obj in meshes:
+        for v in obj.data.vertices:
+            all_v.append(v.co.copy())
+    xs = [v.x for v in all_v]; ys = [v.y for v in all_v]; zs = [v.z for v in all_v]
+    dims = (max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs))
+    print(f'  Model centered, km-scale: max dim {max(dims)*1000:.1f}m')
+
+
+def _load_fbx_model(fbx_path):
+    """Load single-mesh FBX model with proper transform baking."""
+    pre_import = set(bpy.data.objects)
+
+    bpy.ops.import_scene.fbx(filepath=fbx_path)
+
+    # Gather imported objects, remove cameras/lights
+    imported = [o for o in bpy.data.objects if o not in pre_import]
+    for obj in list(imported):
+        if obj.type in ('CAMERA', 'LIGHT'):
+            bpy.data.objects.remove(obj, do_unlink=True)
+            imported.remove(obj)
+
+    meshes = [o for o in imported if o.type == 'MESH']
+    if not meshes:
+        print('  No mesh in FBX, falling back to simple model')
+        return _build_simple_model()
+
+    # Remove empties (we bake transforms, so hierarchy is moot)
+    for obj in list(imported):
+        if obj.type == 'EMPTY':
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    # Step 1: Unparent (in case an empty was a parent of a mesh in our list)
+    _unparent_meshes(meshes)
+
+    # Step 2: Capture FBX model rotation before baking (must set rotation_mode first)
+    global _fbx_model_rot_inv
+    if meshes:
+        meshes[0].rotation_mode = 'QUATERNION'
+        _fbx_model_rot_inv = meshes[0].rotation_quaternion.inverted()
+
+    # Step 3: Bake all transforms on every mesh
+    for obj in meshes:
+        _bake_transform(obj)
+
+    # Step 4: Center geometry, scale to km
+    _center_and_scale_to_km(meshes)
+
+    # Step 5: FBX is a single merged mesh — classify as 'body'
+    # (User should use DSP.blend for per-component rendering)
+    panel_idx = 1
+    for obj in meshes:
+        comp_type, base_idx = _classify_part(obj)
+        # Override: single-mesh FBX → all is 'default' (one instance)
+        if comp_type == 'panel':
+            obj.pass_index = base_idx + panel_idx - 1
+            obj.name = f'panel_{panel_idx}'; panel_idx += 1
+        else:
+            obj.pass_index = 1
+            obj.name = 'body'
+        _add_component_material(obj, comp_type)
+
+    print(f'  Satellite: FBX loaded ({len(meshes)} mesh(es), transforms baked)')
+    return meshes
+
+
+def _load_blend_model(blend_path):
+    """Load user-separated DSP.blend model with proper transform baking."""
+    with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+        data_to.objects = data_from.objects
+
+    new_objects = []
+    for obj in data_to.objects:
+        if obj is not None:
+            bpy.context.collection.objects.link(obj)
+            new_objects.append(obj)
+
+    # Remove cameras, lights, untitled empties that came from the model file
+    for obj in list(new_objects):
+        if obj.type in ('CAMERA', 'LIGHT') or (obj.type == 'EMPTY' and 'untitled' in obj.name.lower()):
+            bpy.data.objects.remove(obj, do_unlink=True)
+            new_objects.remove(obj)
+
+    meshes = [obj for obj in new_objects if obj.type == 'MESH']
+    if not meshes:
+        print('  No meshes in .blend, falling back to simple model')
+        return _build_simple_model()
+
+    # Step 1: Unparent all meshes (CLEAR_KEEP_TRANSFORM preserves world pos)
+    _unparent_meshes(meshes)
+
+    # Step 2: Delete all empties (hierarchy is baked into mesh transforms now)
+    for obj in list(new_objects):
+        if obj.type == 'EMPTY':
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    # Step 3: Capture FBX model rotation before baking (all meshes share the same rot)
+    # This rotation is a modeling convention artifact, NOT the satellite's attitude.
+    # It gets baked into vertex data by _bake_transform; we compensate in update_frame.
+    global _fbx_model_rot_inv
+    if meshes:
+        meshes[0].rotation_mode = 'QUATERNION'
+        _fbx_model_rot_inv = meshes[0].rotation_quaternion.inverted()
+
+    # Step 4: Bake all transforms → identity on every mesh
+    for obj in meshes:
+        _bake_transform(obj)
+
+    # Step 5: Center geometry, scale to km
+    _center_and_scale_to_km(meshes)
+
+    # Step 6: Separate full model from labeled parts.
+    # Full model (1323_00): used for beauty RGB renders (complete geometry).
+    # Labeled parts: used for instance segmentation masks (user-annotated components).
+    # Both are hidden/shown as needed: beauty → full visible, parts hidden.
+    #                                  mask   → full hidden, parts visible.
+    full_model = None
+    panel_idx, phased_idx, reflector_idx, tripod_idx = 1, 1, 1, 1
+    labeled = []
+    for obj in meshes:
+        if obj.name[0].isdigit():
+            # Original full mesh → keep for beauty rendering
+            full_model = obj
+            full_model.name = 'sat_full'
+            full_model.pass_index = 1
+            full_model['is_full_model'] = True
+            _add_component_material(full_model, 'default')
+            full_model.hide_render = False  # visible for beauty
+        else:
+            labeled.append(obj)
+            comp_type, base_idx = _classify_part(obj)
+            if comp_type == 'panel':
+                obj.pass_index = base_idx + panel_idx - 1
+                obj.name = f'panel_{panel_idx}'; panel_idx += 1
+            elif comp_type == 'phased':
+                obj.pass_index = base_idx + phased_idx - 1
+                obj.name = f'antenna_phased_{phased_idx}'; phased_idx += 1
+            elif comp_type == 'reflector':
+                obj.pass_index = base_idx + reflector_idx - 1
+                obj.name = f'antenna_reflector_{reflector_idx}'; reflector_idx += 1
+            elif comp_type == 'tripod':
+                obj.pass_index = base_idx + tripod_idx - 1
+                obj.name = f'tripod_{tripod_idx}'; tripod_idx += 1
+            else:
+                obj.pass_index = 1
+                obj.name = 'body'
+            _add_component_material(obj, comp_type)
+            obj.hide_render = False  # visible for beauty (together with full model)
+
+    # Return: full model first (if exists), then labeled parts
+    result = ([full_model] if full_model else []) + labeled
+    label_count = len(labeled)
+    full_str = ' + full model' if full_model else ''
+    print(f'  Satellite: .blend loaded ({label_count} label parts{full_str}, transforms baked)')
+    return result
+
+
+def _build_simple_model():
+    """Fallback: build simple geometric satellite model with baked transforms."""
+    S = KM_SCALE  # 0.001 = 1 meter in km
+
+    parts_spec = [
+        # (name, shape, location_km, scale_factors, comp_type)
+        # Body: 4m x 2m x 1.5m bus
+        ('body', 'cube', (0, 0, 0), (2.0, 1.0, 0.75), 'body'),
+        # Solar panels: 3.5m x 1m x 0.03m each, at ±3m from center
+        ('panel_1', 'cube', (-3.0*S, 0, 0.1*S), (1.75, 0.5, 0.015), 'panel'),
+        ('panel_2', 'cube', (3.0*S, 0, 0.1*S), (1.75, 0.5, 0.015), 'panel'),
+        # Phased array antenna dish: z=+1.0m
+        ('antenna_phased_1', 'cylinder', (0, 0, 1.0*S), None, 'phased'),
+        # Reflector antenna: z=-1.0m
+        ('antenna_reflector_1', 'cylinder', (0, 0, -1.0*S), None, 'reflector'),
+    ]
+
+    parts = []
+    for name, shape, loc, sc, comp_type in parts_spec:
+        if shape == 'cube':
+            bpy.ops.mesh.primitive_cube_add(size=2.0*S, location=loc)
+            obj = bpy.context.active_object
+            if sc:
+                obj.scale = sc
+                bpy.ops.object.transform_apply(scale=True)
+        else:
+            if 'phased' in name:
+                bpy.ops.mesh.primitive_cylinder_add(radius=0.4*S, depth=0.1*S, location=loc)
+            else:
+                bpy.ops.mesh.primitive_cylinder_add(radius=0.3*S, depth=0.5*S, location=loc)
+            obj = bpy.context.active_object
+
+        obj.name = name
+        parts.append(obj)
+
+        # Classify and assign pass_index
+        ct, base_idx = _classify_part(obj)
+        if ct == 'panel':
+            obj.pass_index = base_idx + len([p for p in parts if 'panel' in p.name]) - 1
+        else:
+            obj.pass_index = base_idx
+
+        _add_component_material(obj, ct)
+
+    # Bake locations into vertex data so offsets are all zero
+    for obj in parts:
+        _bake_transform(obj)
+
+    print(f'  Satellite: simple geometric model ({len(parts)} parts)')
+    return parts
+
+
 def create_satellite_model():
     """
-    Build satellite model in km-scale world coordinates (no parent scaling).
-    Same approach as working debug_dist.py.
+    Load satellite model. Tries in order:
+      1. DSP.blend  — user-separated model with per-component meshes
+      2. FBX file   — single merged mesh from 3D modeling software
+      3. Simple     — geometric primitives fallback
 
-    Model dimensions: ~9m x 2m x 1.5m = ~0.009 x 0.002 x 0.0015 km
+    All paths produce flat lists of independent meshes with:
+      - Identity transforms (location, rotation, scale baked into vertex data)
+      - Vertices in km units, centered at origin
+      - Emission+BSDF materials with correct pass_index for instance segmentation
     """
-    S = KM_SCALE * SAT_MODEL_SCALE  # meters -> km conversion
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    blend_path = os.path.join(project_root, 'output', 'DSP.blend')
+    fbx_path = os.path.join(project_root, 'data', 'sat_models', 'DSP', '1323.fbx')
 
-    # --- Body (main bus): 4m x 2m x 1.5m ---
-    bpy.ops.mesh.primitive_cube_add(size=2.0*S, location=(0, 0, 0))
-    body = bpy.context.active_object
-    body.name = 'body'
-    body.scale = (2.0, 1.0, 0.75)  # 4m x 2m x 1.5m
-    bpy.ops.object.transform_apply(scale=True)  # bake scale into mesh
-    body.pass_index = 1
-
-    # --- Left solar panel: 4m x 1m, very thin ---
-    bpy.ops.mesh.primitive_cube_add(size=2.0*S, location=(-3.0*S, 0, 0.1*S))
-    panel_l = bpy.context.active_object
-    panel_l.name = 'panel_left'
-    panel_l.scale = (2.0, 0.5, 0.02)
-    bpy.ops.object.transform_apply(scale=True)
-    panel_l.pass_index = 2
-
-    # --- Right solar panel ---
-    bpy.ops.mesh.primitive_cube_add(size=2.0*S, location=(3.0*S, 0, 0.1*S))
-    panel_r = bpy.context.active_object
-    panel_r.name = 'panel_right'
-    panel_r.scale = (2.0, 0.5, 0.02)
-    bpy.ops.object.transform_apply(scale=True)
-    panel_r.pass_index = 3
-
-    # --- Antenna: z=+1.0m ---
-    bpy.ops.mesh.primitive_cylinder_add(radius=0.4*S, depth=0.1*S, location=(0, 0, 1.0*S))
-    antenna = bpy.context.active_object
-    antenna.name = 'antenna'
-    antenna.pass_index = 4
-
-    # --- Thruster: z=-1.0m ---
-    bpy.ops.mesh.primitive_cylinder_add(radius=0.3*S, depth=0.5*S, location=(0, 0, -1.0*S))
-    thruster = bpy.context.active_object
-    thruster.name = 'thruster'
-    thruster.pass_index = 5
-
-    # Store all parts in a list for group movement (no parent empty)
-    sat_parts = [body, panel_l, panel_r, antenna, thruster]
-
-    # Add materials
-    for child in [body, panel_l, panel_r, antenna, thruster]:
-        mat = bpy.data.materials.new(child.name + '_mat')
-        nodes = mat.node_tree.nodes
-        nodes.clear()
-
-        emit = nodes.new('ShaderNodeEmission')
-        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-        mix = nodes.new('ShaderNodeMixShader')
-        if 'panel' in child.name:
-            emit.inputs['Color'].default_value = (0.1, 0.2, 0.5, 1.0)
-            bsdf.inputs['Base Color'].default_value = (0.1, 0.2, 0.5, 1.0)
-        elif 'antenna' in child.name:
-            emit.inputs['Color'].default_value = (0.9, 0.9, 0.9, 1.0)
-            bsdf.inputs['Base Color'].default_value = (0.9, 0.9, 0.9, 1.0)
-        elif 'thruster' in child.name:
-            emit.inputs['Color'].default_value = (0.5, 0.3, 0.3, 1.0)
-            bsdf.inputs['Base Color'].default_value = (0.5, 0.3, 0.3, 1.0)
-        else:
-            emit.inputs['Color'].default_value = (0.7, 0.7, 0.7, 1.0)
-            bsdf.inputs['Base Color'].default_value = (0.7, 0.7, 0.7, 1.0)
-        emit.inputs['Strength'].default_value = 10.0
-        bsdf.inputs['Roughness'].default_value = 0.5
-        mix.inputs['Fac'].default_value = 1.0  # 100% emission (bypass BSDF for now)
-
-        output = nodes.new('ShaderNodeOutputMaterial')
-        mat.node_tree.links.new(emit.outputs['Emission'], mix.inputs[1])
-        mat.node_tree.links.new(bsdf.outputs['BSDF'], mix.inputs[2])
-        mat.node_tree.links.new(mix.outputs['Shader'], output.inputs['Surface'])
-        if len(child.data.materials) == 0:
-            child.data.materials.append(mat)
-
-    return sat_parts
+    if os.path.exists(blend_path):
+        return _load_blend_model(blend_path)
+    elif os.path.exists(fbx_path):
+        return _load_fbx_model(fbx_path)
+    else:
+        return _build_simple_model()
 
 
-def setup_camera(fov_deg, resolution):
-    """Create camera for first-person view"""
+def setup_camera(fov_deg, resolution, camera_mode='track'):
+    """Create camera for first-person view.
+    In 'stare' mode, stores the initial boresight direction for fixed ECI pointing.
+    """
     bpy.ops.object.camera_add(location=(0, 0, 0))
     cam = bpy.context.active_object
     cam.name = 'SensorCamera'
-
-    # Convert total FOV to horizontal field of view
-    # Blender expects horizontal FOV in radians
     cam.data.angle = math.radians(fov_deg)
     cam.data.sensor_fit = 'HORIZONTAL'
+    cam.data.clip_start = 0.01
+    cam.data.clip_end = 200000.0
 
-    # Set clip planes for space scale (km units)
-    cam.data.clip_start = 0.01   # 10 meters in km
-    cam.data.clip_end = 200000.0  # 200,000 km
-
-    # Set render resolution
     bpy.context.scene.render.resolution_x = resolution
     bpy.context.scene.render.resolution_y = resolution
     bpy.context.scene.render.resolution_percentage = 100
+
+    # Store camera parameters for use by update_frame
+    cam['camera_mode'] = camera_mode
+    cam['stare_dir'] = None  # set on first update_frame
 
     return cam
 
 
 def setup_sun():
-    """Create directional sun light"""
+    """Create directional sun light. Energy boosted to light the BSDF component
+    of satellite materials (40% emission + 60% BSDF needs good incident light)."""
     bpy.ops.object.light_add(type='SUN', location=(0, 0, 0))
     sun = bpy.context.active_object
     sun.name = 'SunLight'
-    sun.data.energy = 20.0  # Space sunlight (no atmospheric attenuation)
+    sun.data.energy = 60.0  # Subtle BSDF shading, emission carries the visibility
 
     # Create empty for easy orientation
     bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
@@ -286,9 +574,9 @@ def setup_stars(camera):
     # Create backdrop plane far behind any possible satellite distance
     # Camera looks along -Z. 100000 km ensures plane is always behind satellite.
     BACKDROP_DIST = 100000.0  # km, well beyond max satellite distance (~16300 km)
-    # Plane size to fill 0.117 deg FOV at this distance
+    # Plane size scales with camera FOV (read from camera after setup_camera)
     import math as m
-    half_fov = m.radians(0.117 / 2)  # half FOV in radians
+    half_fov = camera.data.angle / 2.0  # actual FOV from camera
     plane_size = 2.0 * BACKDROP_DIST * m.tan(half_fov) * 2.5  # 2.5x margin
     bpy.ops.mesh.primitive_plane_add(size=plane_size, location=(0, 0, -BACKDROP_DIST))
     plane = bpy.context.active_object
@@ -362,19 +650,40 @@ def quaternion_from_row(row):
     return Quaternion((row['qw'], row['qx'], row['qy'], row['qz']))
 
 
-def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target, debug=False):
-    """Update scene objects for a single frame"""
+def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target,
+                  earth=None, debug=False):
+    """Update scene objects for a single frame.
+
+    Coordinate system: camera at origin. All objects placed relative to camera.
+    This avoids float32 precision loss when objects are ~42164 km from scene origin
+    (model is 6.3m but float32 gives only ~5m precision at that distance).
+    """
     obs_pos = position_from_row(obs_row)
     tgt_pos = position_from_row(tgt_row)
     tgt_quat = quaternion_from_row(tgt_row)
     sun_pos = position_from_row(sun_row)
 
-    if debug:
-        print(f"  Frame 0: dist={(tgt_pos - obs_pos).length:.1f} km")
+    # Relative positions (camera at origin)
+    rel_tgt = tgt_pos - obs_pos
+    rel_sun = sun_pos - obs_pos
 
-    # Camera at observer, looking at target
-    camera.location = obs_pos
-    direction = (tgt_pos - obs_pos).normalized()
+    if debug:
+        print(f"  Frame 0: dist={rel_tgt.length:.1f} km")
+
+    # Camera at origin
+    camera.location = Vector((0, 0, 0))
+    # Determine pointing direction
+    camera_mode = camera.get('camera_mode', 'track')
+    if camera_mode == 'stare':
+        if camera['stare_dir'] is None:
+            d0 = rel_tgt.normalized()
+            camera['stare_dir'] = (d0.x, d0.y, d0.z)
+            if debug:
+                print(f"  Stare boresight set to: ({d0.x:.6f}, {d0.y:.6f}, {d0.z:.6f})")
+        sd = camera['stare_dir']
+        direction = Vector(sd)
+    else:
+        direction = rel_tgt.normalized()
     z_axis = -direction
     up = Vector((0, 0, 1))
     if abs(z_axis.dot(up)) > 0.9999:
@@ -386,34 +695,31 @@ def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_ta
         (x_axis.y, y_axis.y, z_axis.y),
         (x_axis.z, y_axis.z, z_axis.z)
     )).to_4x4()
-    camera.matrix_world = Matrix.Translation(obs_pos) @ rot
+    camera.matrix_world = rot  # at origin, no translation
 
     # --- Starfield rotation compensation (celestial fix) ---
     if hasattr(setup_stars, 'mapping_node') and hasattr(setup_stars, 'ref_matrix'):
         mapping = setup_stars.mapping_node
         if setup_stars.ref_matrix is None:
-            # First frame: capture reference camera orientation
             setup_stars.ref_matrix = rot.copy()
         else:
-            # Compute delta rotation from reference: R_delta = R_ref^T * R_curr
             R_delta = setup_stars.ref_matrix.inverted() @ rot
-            # Apply INVERSE to mapping so stars stay fixed in ECI
             R_comp = R_delta.inverted()
-            # Convert 4x4 to 3x3 rotation, extract Euler (radians, ZYX order for Mapping node)
             euler = R_comp.to_3x3().to_euler('XYZ')
             mapping.inputs['Rotation'].default_value = (euler.x, euler.y, euler.z)
 
-    # Satellite parts: move all to target position + rotate
-    # Store initial offsets on first call
-    if not hasattr(update_frame, 'offsets'):
-        update_frame.offsets = [p.location.copy() for p in sat_parts]
-    for part, offset in zip(sat_parts, update_frame.offsets):
-        part.location = tgt_pos + tgt_quat @ offset
+    # Satellite parts at relative target position
+    for part in sat_parts:
+        part.location = rel_tgt
         part.rotation_mode = 'QUATERNION'
-        part.rotation_quaternion = tgt_quat
+        part.rotation_quaternion = tgt_quat @ _fbx_model_rot_inv
+
+    # Earth at negative observer position (camera at origin → Earth relative to camera)
+    if earth is not None:
+        earth.location = -obs_pos
 
     # Sun light direction
-    sun_dir = sun_pos.normalized()
+    sun_dir = rel_sun.normalized()
     z_sun = sun_dir
     up_sun = Vector((0, 0, 1))
     if abs(z_sun.dot(up_sun)) > 0.9999:
@@ -437,48 +743,32 @@ import numpy as np
 
 DEBUG_MASK = False  # Set True to print per-frame mask pixel statistics
 
-COMPONENT_CLASSES = {
-    'body': 1,
-    'panel_left': 2,
-    'panel_right': 3,
-    'antenna': 4,
-    'thruster': 5,
-}
-
-CLASS_NAMES = {v: k for k, v in COMPONENT_CLASSES.items()}
-
-# Mask colors: category id encoded directly in red channel (1..5),
-# green/blue zero. Unambiguous up to 255 classes.
-MASK_COLORS = {
-    'body':        (1.0, 0.0, 0.0, 1.0),
-    'panel_left':  (2/255, 0.0, 0.0, 1.0),
-    'panel_right': (3/255, 0.0, 0.0, 1.0),
-    'antenna':     (4/255, 0.0, 0.0, 1.0),
-    'thruster':    (5/255, 0.0, 0.0, 1.0),
-}
-
+# Instance segmentation: category IDs and per-instance pixel values
 COCO_CATEGORIES = [
     {"id": 1, "name": "body", "supercategory": "satellite"},
-    {"id": 2, "name": "panel_left", "supercategory": "satellite"},
-    {"id": 3, "name": "panel_right", "supercategory": "satellite"},
-    {"id": 4, "name": "antenna", "supercategory": "satellite"},
-    {"id": 5, "name": "thruster", "supercategory": "satellite"},
+    {"id": 2, "name": "solar_panel", "supercategory": "satellite"},
+    {"id": 3, "name": "phased_array_antenna", "supercategory": "satellite"},
+    {"id": 4, "name": "reflector_antenna", "supercategory": "satellite"},
+    {"id": 5, "name": "solar_panel_tripod", "supercategory": "satellite"},
 ]
 
-# ---- mask colors in 0-255 pixel values ----
-MASK_PIXEL_VALUE = {  # category id -> red channel pixel value
-    'body': 1, 'panel_left': 2, 'panel_right': 3, 'antenna': 4, 'thruster': 5,
+# Object name prefix -> COCO category ID
+CATEGORY_BY_NAME = {
+    'body': 1, 'panel': 2, 'antenna_phased': 3, 'antenna_reflector': 4, 'tripod': 5,
 }
-# Map pixel value (0-255) -> category id (same numbers, identity here)
+
+# Pixel value assignment:
+#   1=body, 2-99=panel_N(solar_panel), 100-149=phased_array, 150-199=reflector, 200-249=tripod_N
+# Instance numbering is dynamic based on object names
 
 
-def build_mask_material(name, color255):
-    """Pure-color emission material encoding category id in red channel (0-255)."""
+def build_mask_material(name, pixel_value):
+    """Pure-color emission encoding instance pixel value in red channel (0-255)."""
     mat = bpy.data.materials.new(name)
     nodes = mat.node_tree.nodes
     nodes.clear()
     emit = nodes.new('ShaderNodeEmission')
-    emit.inputs['Color'].default_value = (color255 / 255.0, 0.0, 0.0, 1.0)
+    emit.inputs['Color'].default_value = (pixel_value / 255.0, 0.0, 0.0, 1.0)
     emit.inputs['Strength'].default_value = 1.0
     out = nodes.new('ShaderNodeOutputMaterial')
     mat.node_tree.links.new(emit.outputs['Emission'], out.inputs['Surface'])
@@ -486,21 +776,41 @@ def build_mask_material(name, color255):
 
 
 def assign_mask_materials(sat_parts):
-    """Swap each part's material for the mask color; returns originals for restore."""
+    """Swap each label part for mask color. Full model (is_full_model) is hidden;
+    label parts are shown and get pure-emission mask materials."""
     originals = {}
     for part in sat_parts:
-        pixval = MASK_PIXEL_VALUE.get(part.name, 0)
-        originals[part.name] = [m for m in part.data.materials]
-        part.data.materials.clear()
-        part.data.materials.append(build_mask_material(f'mask_{part.name}', pixval))
+        if part.type != 'MESH':
+            continue
+        if part.get('is_full_model', False):
+            # Hide full model during mask render
+            part.hide_render = True
+        else:
+            # Show label part, apply mask material
+            part.hide_render = False
+            pixval = part.pass_index
+            if pixval == 0:
+                pixval = 1
+            originals[part.name] = [m for m in part.data.materials]
+            part.data.materials.clear()
+            part.data.materials.append(build_mask_material(f'mask_{part.name}', pixval))
     return originals
 
 
 def restore_materials(sat_parts, originals):
+    """Restore beauty materials. Full model is shown; label parts are hidden."""
     for part in sat_parts:
-        part.data.materials.clear()
-        for m in originals.get(part.name, []):
-            part.data.materials.append(m)
+        if part.type != 'MESH':
+            continue
+        if part.get('is_full_model', False):
+            # Show full model for beauty render
+            part.hide_render = False
+        else:
+            # Show label part for beauty (completes full model), restore material
+            part.hide_render = False
+            part.data.materials.clear()
+            for m in originals.get(part.name, []):
+                part.data.materials.append(m)
 
 
 def render_mask_image(resolution, samples_backup, tmp_exr_path):
@@ -592,8 +902,21 @@ def mask_to_annotations(mask, frame_id, image_filename, ann_id_start):
     yolo_lines = []
     ann_id = ann_id_start
 
-    for cat_name, cat_id in COMPONENT_CLASSES.items():
-        pixval = MASK_PIXEL_VALUE[cat_name]
+    # pixel→category using nearest-neighbor (anti-alias spreads edge pixels)
+    KNOWN_PIXELS = [1, 2, 3, 4, 5, 100, 150, 200]
+    def pixel_to_category(pix):
+        # Find nearest known pixel value
+        nearest = min(KNOWN_PIXELS, key=lambda k: abs(k - pix))
+        if nearest == 1: return 1
+        if 2 <= nearest <= 99: return 2
+        if 100 <= nearest <= 149: return 3
+        if 150 <= nearest <= 199: return 4
+        if 200 <= nearest <= 249: return 5
+        return None
+    for pixval in range(1, 256):
+        cat_id = pixel_to_category(pixval)
+        if cat_id is None:
+            continue
         binary = (mask == pixval)
         area = int(binary.sum())
         if area == 0:
@@ -641,9 +964,10 @@ def main():
 
     # Load data
     obs_data, tgt_data, sun_data, config = load_all_data(args.ephem_dir)
-    fov_deg = config.get('sensor_fov_deg', 0.117)
+    fov_deg = args.fov  # command-line overrides config default, default matches
     resolution = args.resolution
     samples = args.samples
+    camera_mode = args.camera_mode
     enable_annotations = not args.no_annotations
 
     # Determine frame range
@@ -688,7 +1012,7 @@ def main():
     print("\n--- Building Scene ---")
     earth = create_earth()
     sat_parts = create_satellite_model()
-    camera = setup_camera(fov_deg, resolution)
+    camera = setup_camera(fov_deg, resolution, camera_mode)
     sun_light, sun_target = setup_sun()
     setup_stars(camera)
     setup_render(samples)
@@ -712,7 +1036,7 @@ def main():
         tgt_row = tgt_data[actual_idx]
         sun_row = sun_data[actual_idx] if actual_idx < len(sun_data) else sun_data[0]
 
-        update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target)
+        update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target, earth)
 
         # 1. Beauty render (RGB)
         output_path = os.path.join(image_dir, f'frame_{actual_idx:04d}.png')

@@ -19,20 +19,23 @@ import zlib
 import struct
 import numpy as np
 
-COMPONENT_CLASSES = {
-    'body': 1,
-    'panel_left': 2,
-    'panel_right': 3,
-    'antenna': 4,
-    'thruster': 5,
-}
+# pixel → COCO category mapping
+KNOWN_PIXELS = [1, 2, 3, 4, 5, 100, 150, 200]
+def pixel_to_category(pix):
+    near = min(KNOWN_PIXELS, key=lambda k: abs(k - pix))
+    if near == 1: return 1
+    if 2 <= near <= 99: return 2
+    if 100 <= near <= 149: return 3
+    if 150 <= near <= 199: return 4
+    if 200 <= near <= 249: return 5
+    return None
 
 COCO_CATEGORIES = [
     {"id": 1, "name": "body", "supercategory": "satellite"},
-    {"id": 2, "name": "panel_left", "supercategory": "satellite"},
-    {"id": 3, "name": "panel_right", "supercategory": "satellite"},
-    {"id": 4, "name": "antenna", "supercategory": "satellite"},
-    {"id": 5, "name": "thruster", "supercategory": "satellite"},
+    {"id": 2, "name": "solar_panel", "supercategory": "satellite"},
+    {"id": 3, "name": "phased_array_antenna", "supercategory": "satellite"},
+    {"id": 4, "name": "reflector_antenna", "supercategory": "satellite"},
+    {"id": 5, "name": "solar_panel_tripod", "supercategory": "satellite"},
 ]
 
 
@@ -79,7 +82,8 @@ def main(mask_dir, out_dir, val_stride=5):
         for f in sorted(os.listdir(d)):
             fp = os.path.join(d, f)
             if os.path.isdir(fp):
-                collect(fp)
+                if os.path.basename(fp) != 'no_starfield':  # skip old batch archive
+                    collect(fp)
             elif f.startswith('frame_') and f.endswith('.png'):
                 # Extract frame number: frame_XXXXX.png -> XXXXX (variable length)
                 n = int(re.match(r'frame_(\d+)\.png$', f).group(1))
@@ -107,8 +111,11 @@ def main(mask_dir, out_dir, val_stride=5):
             "height": int(h),
         })
 
-        for cat_name, cat_id in COMPONENT_CLASSES.items():
-            binary = (mask == cat_id)
+        for pixval in range(1, 256):
+            cat_id = pixel_to_category(pixval)
+            if cat_id is None:
+                continue
+            binary = (mask == pixval)
             area = int(binary.sum())
             if area == 0:
                 continue

@@ -51,6 +51,11 @@ def parse_args():
                         choices=['track', 'stare'],
                         help='track: camera follows target; stare: fixed ECI boresight')
     parser.add_argument('--fov', type=float, default=0.117, help='Camera FOV in degrees')
+    parser.add_argument('--model_scale', type=float, default=1.0,
+                        help='Scale factor for satellite model (e.g. 10.0 = 10x larger)')
+    parser.add_argument('--model_type', type=str, default='auto',
+                        choices=['auto', 'dsp_blend', 'simple'],
+                        help='Satellite model: auto (detect), dsp_blend, simple')
     parser.add_argument('--no_annotations', action='store_true', help='Skip mask/COCO/YOLO/pose generation')
     return parser.parse_args(argv)
 
@@ -250,13 +255,13 @@ def _unparent_meshes(meshes):
             obj.select_set(False)
 
 
-def _center_and_scale_to_km(meshes):
+def _center_and_scale_to_km(meshes, model_scale=1.0):
     """
     Compute geometric center of all mesh vertices, shift so center → origin,
-    then scale all vertex data by KM_SCALE.
+    then scale all vertex data by KM_SCALE * model_scale.
 
     After this: all meshes have identity transforms, vertices in km units,
-    model geometric center at origin.
+    model geometric center at origin. model_scale > 1 enlarges the model.
     """
     if not meshes:
         return
@@ -269,9 +274,9 @@ def _center_and_scale_to_km(meshes):
             all_verts.append(mw @ v.co)
     center = sum(all_verts, Vector((0, 0, 0))) / len(all_verts)
 
-    # Build transform: translate center → origin, then scale to km
-    # Order: Translation(-center) applied first, then Scale(KM)
-    to_km = Matrix.Scale(KM_SCALE, 4) @ Matrix.Translation(-center)
+    # Build transform: translate center → origin, then scale to km * model_scale
+    total_scale = KM_SCALE * model_scale
+    to_km = Matrix.Scale(total_scale, 4) @ Matrix.Translation(-center)
 
     for obj in meshes:
         obj.data.transform(to_km)
@@ -283,10 +288,11 @@ def _center_and_scale_to_km(meshes):
             all_v.append(v.co.copy())
     xs = [v.x for v in all_v]; ys = [v.y for v in all_v]; zs = [v.z for v in all_v]
     dims = (max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs))
-    print(f'  Model centered, km-scale: max dim {max(dims)*1000:.1f}m')
+    scale_str = f' (x{model_scale})' if model_scale != 1.0 else ''
+    print(f'  Model centered, km-scale: max dim {max(dims)*1000:.1f}m{scale_str}')
 
 
-def _load_fbx_model(fbx_path):
+def _load_fbx_model(fbx_path, model_scale=1.0):
     """Load single-mesh FBX model with proper transform baking."""
     pre_import = set(bpy.data.objects)
 
@@ -323,7 +329,7 @@ def _load_fbx_model(fbx_path):
         _bake_transform(obj)
 
     # Step 4: Center geometry, scale to km
-    _center_and_scale_to_km(meshes)
+    _center_and_scale_to_km(meshes, model_scale)
 
     # Step 5: FBX is a single merged mesh — classify as 'body'
     # (User should use DSP.blend for per-component rendering)
@@ -343,7 +349,7 @@ def _load_fbx_model(fbx_path):
     return meshes
 
 
-def _load_blend_model(blend_path):
+def _load_blend_model(blend_path, model_scale=1.0):
     """Load user-separated DSP.blend model with proper transform baking."""
     with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
         data_to.objects = data_from.objects
@@ -386,7 +392,7 @@ def _load_blend_model(blend_path):
         _bake_transform(obj)
 
     # Step 5: Center geometry, scale to km
-    _center_and_scale_to_km(meshes)
+    _center_and_scale_to_km(meshes, model_scale)
 
     # Step 6: Separate full model from labeled parts.
     # Full model (1323_00): used for beauty RGB renders (complete geometry).
@@ -434,9 +440,9 @@ def _load_blend_model(blend_path):
     return result
 
 
-def _build_simple_model():
+def _build_simple_model(model_scale=1.0):
     """Fallback: build simple geometric satellite model with baked transforms."""
-    S = KM_SCALE  # 0.001 = 1 meter in km
+    S = KM_SCALE * model_scale  # 0.001 = 1 meter in km, scaled
 
     parts_spec = [
         # (name, shape, location_km, scale_factors, comp_type)
@@ -486,28 +492,37 @@ def _build_simple_model():
     return parts
 
 
-def create_satellite_model():
+def create_satellite_model(model_scale=1.0, model_type='auto'):
     """
-    Load satellite model. Tries in order:
-      1. DSP.blend  — user-separated model with per-component meshes
-      2. FBX file   — single merged mesh from 3D modeling software
-      3. Simple     — geometric primitives fallback
+    Load satellite model.
 
-    All paths produce flat lists of independent meshes with:
-      - Identity transforms (location, rotation, scale baked into vertex data)
-      - Vertices in km units, centered at origin
-      - Emission+BSDF materials with correct pass_index for instance segmentation
+    model_type:
+      - 'auto':      auto-detect (try DSP.blend, then FBX, then simple)
+      - 'dsp_blend': force DSP.blend (user-separated components + full model)
+      - 'simple':    force simple geometric primitives
+
+    All paths produce flat lists of independent meshes with identity transforms,
+    vertices in km units centered at origin.
     """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     blend_path = os.path.join(project_root, 'output', 'DSP.blend')
     fbx_path = os.path.join(project_root, 'data', 'sat_models', 'DSP', '1323.fbx')
 
-    if os.path.exists(blend_path):
-        return _load_blend_model(blend_path)
-    elif os.path.exists(fbx_path):
-        return _load_fbx_model(fbx_path)
-    else:
-        return _build_simple_model()
+    if model_type == 'simple':
+        return _build_simple_model(model_scale)
+    elif model_type == 'dsp_blend':
+        if os.path.exists(blend_path):
+            return _load_blend_model(blend_path, model_scale)
+        else:
+            print(f'  DSP.blend not found at {blend_path}, falling back to simple')
+            return _build_simple_model(model_scale)
+    else:  # auto
+        if os.path.exists(blend_path):
+            return _load_blend_model(blend_path, model_scale)
+        elif os.path.exists(fbx_path):
+            return _load_fbx_model(fbx_path, model_scale)
+        else:
+            return _build_simple_model(model_scale)
 
 
 def setup_camera(fov_deg, resolution, camera_mode='track'):
@@ -1011,7 +1026,7 @@ def main():
     # Build scene
     print("\n--- Building Scene ---")
     earth = create_earth()
-    sat_parts = create_satellite_model()
+    sat_parts = create_satellite_model(args.model_scale, args.model_type)
     camera = setup_camera(fov_deg, resolution, camera_mode)
     sun_light, sun_target = setup_sun()
     setup_stars(camera)

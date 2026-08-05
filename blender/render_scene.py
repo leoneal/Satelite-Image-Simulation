@@ -62,6 +62,10 @@ def parse_args():
                         help='Number of attitude variations per frame (1=original only)')
     parser.add_argument('--attitude_jitter_deg', type=float, default=0.0,
                         help='Max random attitude perturbation in degrees (uniform cone)')
+    parser.add_argument('--sun_phase_offsets', type=str, default='',
+                        help='Comma-separated sun phase offsets in degrees (e.g. "30,90,150")')
+    parser.add_argument('--sun_energy_range', type=str, default='',
+                        help='Sun energy range "min,max" for random sampling (e.g. "40,120")')
     return parser.parse_args(argv)
 
 
@@ -206,33 +210,28 @@ def _classify_part(obj):
 
 
 def _add_component_material(obj, comp_type):
-    """
-    Add emission+BSDF material to a mesh. 40% emission + 60% BSDF gives:
-    - Self-illumination so the satellite is visible against black space
-    - Directional shading so surface orientation is visible (3D depth cue)
-    - Sun lamp provides additional directional lighting on the BSDF component
-    """
+    """BSDF-dominant material with trace emission to prevent pure-black shadows."""
     mat = bpy.data.materials.new(obj.name + '_mat')
     nodes = mat.node_tree.nodes
     nodes.clear()
 
     color = COMPONENT_COLORS.get(comp_type, COMPONENT_COLORS['default'])
 
-    emit = nodes.new('ShaderNodeEmission')
-    emit.inputs['Color'].default_value = (*color, 1.0)
-    emit.inputs['Strength'].default_value = 3.0  # Bright enough for space, won't saturate
-
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.inputs['Base Color'].default_value = (*color, 1.0)
     bsdf.inputs['Roughness'].default_value = 0.4
     bsdf.inputs['Metallic'].default_value = 0.3
 
+    emit = nodes.new('ShaderNodeEmission')
+    emit.inputs['Color'].default_value = (*color, 1.0)
+    emit.inputs['Strength'].default_value = 1.0
+
     mix = nodes.new('ShaderNodeMixShader')
-    mix.inputs['Fac'].default_value = 0.85  # 85% emission, 15% BSDF for subtle surface detail
+    mix.inputs['Fac'].default_value = 0.05  # 5% emission, barely visible
 
     output = nodes.new('ShaderNodeOutputMaterial')
-    mat.node_tree.links.new(emit.outputs['Emission'], mix.inputs[1])
-    mat.node_tree.links.new(bsdf.outputs['BSDF'], mix.inputs[2])
+    mat.node_tree.links.new(bsdf.outputs['BSDF'], mix.inputs[1])
+    mat.node_tree.links.new(emit.outputs['Emission'], mix.inputs[2])
     mat.node_tree.links.new(mix.outputs['Shader'], output.inputs['Surface'])
 
     obj.data.materials.clear()
@@ -559,7 +558,7 @@ def setup_sun():
     bpy.ops.object.light_add(type='SUN', location=(0, 0, 0))
     sun = bpy.context.active_object
     sun.name = 'SunLight'
-    sun.data.energy = 60.0  # Subtle BSDF shading, emission carries the visibility
+    sun.data.energy = 200.0  # Moderate sunlight — bright enough for BSDF, avoids clipping
 
     # Create empty for easy orientation
     bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
@@ -671,12 +670,12 @@ def quaternion_from_row(row):
 
 
 def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target,
-                  earth=None, perturb_quat=None, debug=False):
+                  earth=None, perturb_quat=None, sun_phase_offset=0.0, debug=False):
     """Update scene objects for a single frame.
 
     Coordinate system: camera at origin. All objects placed relative to camera.
-    perturb_quat: optional Quaternion perturbation applied to target attitude
-                  (used for data augmentation).
+    perturb_quat: optional Quaternion perturbation applied to target attitude.
+    sun_phase_offset: rotate sun direction around observer-target axis (degrees).
     """
     obs_pos = position_from_row(obs_row)
     tgt_pos = position_from_row(tgt_row)
@@ -743,8 +742,21 @@ def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_ta
     if earth is not None:
         earth.location = -obs_pos
 
-    # Sun light direction
-    sun_dir = rel_sun.normalized()
+    # Sun light direction (with optional phase offset for augmentation)
+    # Rotate sun around the axis perpendicular to camera-target and target-sun,
+    # maximizing the change in sun-camera angle for visible lighting variation.
+    if sun_phase_offset != 0.0:
+        tgt_to_sun = sun_pos - tgt_pos
+        rot_axis = rel_tgt.cross(tgt_to_sun).normalized()
+        phase_quat = Quaternion(rot_axis, math.radians(sun_phase_offset))
+        new_tgt_to_sun = phase_quat @ tgt_to_sun
+        sun_dir = (new_tgt_to_sun + rel_tgt).normalized()
+    else:
+        sun_dir = rel_sun.normalized()
+    if debug:
+        cam_dir = rel_tgt.normalized()
+        angle = math.degrees(math.acos(max(-1, min(1, cam_dir.dot(sun_dir)))))
+        print(f"    sun_phase_offset={sun_phase_offset}, sun-camera angle={angle:.1f}°")
     z_sun = sun_dir
     up_sun = Vector((0, 0, 1))
     if abs(z_sun.dot(up_sun)) > 0.9999:
@@ -757,6 +769,9 @@ def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_ta
         (x_sun.z, y_sun.z, z_sun.z)
     )).to_4x4()
     sun_light.matrix_world = rot_sun
+    # Ensure orientation sticks by also setting quaternion directly
+    sun_light.rotation_mode = 'QUATERNION'
+    sun_light.rotation_quaternion = rot_sun.to_quaternion()
     sun_target.location = Vector((0, 0, 0))
 
 
@@ -1071,35 +1086,80 @@ def main():
     coco_annotations = []
     ann_id = 1
 
-    # Render loop
-    num_variations = max(1, args.frame_variations)
+    # Render loop — build combination matrix for attitude × sun variations
+    num_attitude_vars = max(1, args.frame_variations)
     jitter_deg = args.attitude_jitter_deg
-    print(f"\n--- Rendering ({num_variations} variations/frame, jitter={jitter_deg}°) ---")
+
+    # Parse sun phase offsets (deduplicated, 0.0 always present as baseline)
+    sun_offsets = [0.0]
+    if args.sun_phase_offsets:
+        for x in args.sun_phase_offsets.split(','):
+            val = float(x.strip())
+            if val != 0.0 and val not in sun_offsets:
+                sun_offsets.append(val)
+
+    # Parse sun energy range
+    sun_energy_min, sun_energy_max = 200.0, 200.0  # default
+    if args.sun_energy_range:
+        parts = [x.strip() for x in args.sun_energy_range.split(',')]
+        if len(parts) == 2:
+            sun_energy_min, sun_energy_max = float(parts[0]), float(parts[1])
+
+    # Build flat list of (attitude_var_idx, sun_offset_deg) combinations
+    # v000 = (0, 0.0) = original attitude + original sun
+    combinations = [(0, 0.0)]
+    for av in range(num_attitude_vars):
+        for so in sun_offsets:
+            if av == 0 and so == 0.0:
+                continue
+            combinations.append((av, so))
+    total_combos = len(combinations)
+
+    aug_info = f"{num_attitude_vars} att vars"
+    if jitter_deg > 0:
+        aug_info += f", jitter={jitter_deg}°"
+    if len(sun_offsets) > 1:
+        aug_info += f", {len(sun_offsets)} sun phases ({args.sun_phase_offsets})"
+    if args.sun_energy_range:
+        aug_info += f", sun energy {sun_energy_min}-{sun_energy_max}"
+    print(f"\n--- Rendering ({total_combos} combinations/frame: {aug_info}) ---")
+
     for frame_idx, actual_idx in enumerate(frame_indices):
 
         obs_row = obs_data[actual_idx]
         tgt_row = tgt_data[actual_idx]
         sun_row = sun_data[actual_idx] if actual_idx < len(sun_data) else sun_data[0]
 
-        for var_idx in range(num_variations):
-            # Generate perturbation (v000 = identity/no perturbation)
-            if jitter_deg > 0.0 and var_idx > 0:
-                random.seed(actual_idx * 1000 + var_idx)
+        for combo_idx, (av, so) in enumerate(combinations):
+            # Attitude perturbation
+            if jitter_deg > 0.0 and av > 0:
+                random.seed(actual_idx * 1000 + av)
                 perturb = random_cone_quaternion(jitter_deg)
             else:
                 perturb = None
 
-            # Unique frame ID for annotations: actual_idx * 1000 + var_idx
-            var_frame_id = actual_idx * 1000 + var_idx
+            # Sun phase offset (0.0 = original)
+            sun_offset = so
+
+            # Random sun energy within range
+            if sun_energy_min != sun_energy_max:
+                random.seed(actual_idx * 1000 + combo_idx + 9999)
+                sun_light.data.energy = random.uniform(sun_energy_min, sun_energy_max)
+            else:
+                sun_light.data.energy = 200.0
+
+            # Unique frame ID for annotations
+            var_frame_id = actual_idx * 1000 + combo_idx
 
             # File naming
-            if var_idx == 0:
+            if combo_idx == 0:
                 fname = f'frame_{actual_idx:04d}'
             else:
-                fname = f'frame_{actual_idx:04d}_v{var_idx:03d}'
+                fname = f'frame_{actual_idx:04d}_v{combo_idx:03d}'
 
             update_frame(obs_row, tgt_row, sun_row, camera, sat_parts,
-                         sun_light, sun_target, earth, perturb_quat=perturb)
+                         sun_light, sun_target, earth,
+                         perturb_quat=perturb, sun_phase_offset=sun_offset)
 
             # 1. Beauty render (RGB)
             output_path = os.path.join(image_dir, f'{fname}.png')
@@ -1126,13 +1186,16 @@ def main():
 
                 # 4. Pose ground truth (with perturbed quaternion)
                 write_pose_file(pose_dir, actual_idx, tgt_row, obs_row,
-                                perturb_quat=perturb, var_idx=var_idx)
+                                perturb_quat=perturb, var_idx=combo_idx)
+
+        # Restore sun energy after all variations for this frame
+        sun_light.data.energy = 200.0
 
         # Progress per original frame
         if frame_idx % 10 == 0 or frame_idx == num_render - 1:
             progress = (frame_idx + 1) / num_render * 100
             print(f"  [{frame_idx + 1}/{num_render}] {progress:.0f}% - Frame {actual_idx}"
-                  f" ({num_variations} vars)")
+                  f" ({total_combos} combos)")
 
     print(f"\n--- Rendering Complete ---")
     print(f"Images: {image_dir}")

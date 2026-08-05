@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import math
+import random
 import argparse
 from mathutils import Vector, Matrix, Quaternion, Euler
 
@@ -57,6 +58,10 @@ def parse_args():
                         choices=['auto', 'dsp_blend', 'simple'],
                         help='Satellite model: auto (detect), dsp_blend, simple')
     parser.add_argument('--no_annotations', action='store_true', help='Skip mask/COCO/YOLO/pose generation')
+    parser.add_argument('--frame_variations', type=int, default=1,
+                        help='Number of attitude variations per frame (1=original only)')
+    parser.add_argument('--attitude_jitter_deg', type=float, default=0.0,
+                        help='Max random attitude perturbation in degrees (uniform cone)')
     return parser.parse_args(argv)
 
 
@@ -666,12 +671,12 @@ def quaternion_from_row(row):
 
 
 def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target,
-                  earth=None, debug=False):
+                  earth=None, perturb_quat=None, debug=False):
     """Update scene objects for a single frame.
 
     Coordinate system: camera at origin. All objects placed relative to camera.
-    This avoids float32 precision loss when objects are ~42164 km from scene origin
-    (model is 6.3m but float32 gives only ~5m precision at that distance).
+    perturb_quat: optional Quaternion perturbation applied to target attitude
+                  (used for data augmentation).
     """
     obs_pos = position_from_row(obs_row)
     tgt_pos = position_from_row(tgt_row)
@@ -724,10 +729,15 @@ def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_ta
             mapping.inputs['Rotation'].default_value = (euler.x, euler.y, euler.z)
 
     # Satellite parts at relative target position
+    # Apply perturbation if provided (data augmentation)
+    if perturb_quat is not None:
+        effective_quat = tgt_quat @ perturb_quat @ _fbx_model_rot_inv
+    else:
+        effective_quat = tgt_quat @ _fbx_model_rot_inv
     for part in sat_parts:
         part.location = rel_tgt
         part.rotation_mode = 'QUATERNION'
-        part.rotation_quaternion = tgt_quat @ _fbx_model_rot_inv
+        part.rotation_quaternion = effective_quat
 
     # Earth at negative observer position (camera at origin → Earth relative to camera)
     if earth is not None:
@@ -961,13 +971,35 @@ def mask_to_annotations(mask, frame_id, image_filename, ann_id_start):
     return coco_img, coco_anns, yolo_lines, ann_id
 
 
-def write_pose_file(pose_dir, frame_id, tgt_row, obs_row):
+def random_cone_quaternion(max_angle_deg):
+    """Generate a random quaternion with rotation angle <= max_angle_deg
+    around a uniformly random axis (cone sampling)."""
+    max_angle = math.radians(max_angle_deg)
+    # Uniform random axis on sphere
+    z = random.uniform(-1.0, 1.0)
+    theta = random.uniform(0.0, 2.0 * math.pi)
+    r = math.sqrt(1.0 - z * z)
+    axis = Vector((r * math.cos(theta), r * math.sin(theta), z))
+    # Random angle within cone
+    angle = random.uniform(0.0, max_angle)
+    return Quaternion(axis, angle)
+
+
+def write_pose_file(pose_dir, frame_id, tgt_row, obs_row, perturb_quat=None, var_idx=0):
     qx, qy, qz, qw = tgt_row['qx'], tgt_row['qy'], tgt_row['qz'], tgt_row['qw']
+    quat = Quaternion((qw, qx, qy, qz))
+    if perturb_quat is not None:
+        quat = quat @ perturb_quat
     rx = tgt_row['pos_x_m'] - obs_row['pos_x_m']
     ry = tgt_row['pos_y_m'] - obs_row['pos_y_m']
     rz = tgt_row['pos_z_m'] - obs_row['pos_z_m']
-    with open(os.path.join(pose_dir, f'frame_{frame_id:04d}.txt'), 'w') as f:
-        f.write(f'{qx:.8f} {qy:.8f} {qz:.8f} {qw:.8f} {rx:.6f} {ry:.6f} {rz:.6f}\n')
+    if var_idx == 0:
+        fname = f'frame_{frame_id:04d}.txt'
+    else:
+        fname = f'frame_{frame_id:04d}_v{var_idx:03d}.txt'
+    with open(os.path.join(pose_dir, fname), 'w') as f:
+        f.write(f'{quat.x:.8f} {quat.y:.8f} {quat.z:.8f} {quat.w:.8f} '
+                f'{rx:.6f} {ry:.6f} {rz:.6f}\n')
 
 
 # ============================================================
@@ -1040,44 +1072,67 @@ def main():
     ann_id = 1
 
     # Render loop
-    print(f"\n--- Rendering ---")
+    num_variations = max(1, args.frame_variations)
+    jitter_deg = args.attitude_jitter_deg
+    print(f"\n--- Rendering ({num_variations} variations/frame, jitter={jitter_deg}°) ---")
     for frame_idx, actual_idx in enumerate(frame_indices):
-
-        if frame_idx % 50 == 0:
-            progress = frame_idx / num_render * 100
-            print(f"  [{frame_idx}/{num_render}] {progress:.0f}% - Frame {actual_idx}")
 
         obs_row = obs_data[actual_idx]
         tgt_row = tgt_data[actual_idx]
         sun_row = sun_data[actual_idx] if actual_idx < len(sun_data) else sun_data[0]
 
-        update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_target, earth)
+        for var_idx in range(num_variations):
+            # Generate perturbation (v000 = identity/no perturbation)
+            if jitter_deg > 0.0 and var_idx > 0:
+                random.seed(actual_idx * 1000 + var_idx)
+                perturb = random_cone_quaternion(jitter_deg)
+            else:
+                perturb = None
 
-        # 1. Beauty render (RGB)
-        output_path = os.path.join(image_dir, f'frame_{actual_idx:04d}.png')
-        bpy.context.scene.render.filepath = output_path
-        bpy.ops.render.render(write_still=True)
+            # Unique frame ID for annotations: actual_idx * 1000 + var_idx
+            var_frame_id = actual_idx * 1000 + var_idx
 
-        if enable_annotations:
-            # 2. Mask render (pure-color, 1 sample)
-            originals = assign_mask_materials(sat_parts)
-            tmp_exr = os.path.join(mask_dir, f'_tmp_{actual_idx:04d}.exr')
-            mask = render_mask_image(resolution, samples, tmp_exr)
-            restore_materials(sat_parts, originals)
+            # File naming
+            if var_idx == 0:
+                fname = f'frame_{actual_idx:04d}'
+            else:
+                fname = f'frame_{actual_idx:04d}_v{var_idx:03d}'
 
-            # Save mask PNG
-            save_mask_png(mask, os.path.join(mask_dir, f'frame_{actual_idx:04d}.png'))
+            update_frame(obs_row, tgt_row, sun_row, camera, sat_parts,
+                         sun_light, sun_target, earth, perturb_quat=perturb)
 
-            # 3. Extract annotations from mask
-            img_entry, ann_entries, yolo_lines, ann_id = mask_to_annotations(
-                mask, actual_idx, f'frame_{actual_idx:04d}.png', ann_id)
-            coco_images.append(img_entry)
-            coco_annotations.extend(ann_entries)
-            with open(os.path.join(yolo_dir, f'frame_{actual_idx:04d}.txt'), 'w') as f:
-                f.write('\n'.join(yolo_lines) + ('\n' if yolo_lines else ''))
+            # 1. Beauty render (RGB)
+            output_path = os.path.join(image_dir, f'{fname}.png')
+            bpy.context.scene.render.filepath = output_path
+            bpy.ops.render.render(write_still=True)
 
-            # 4. Pose ground truth
-            write_pose_file(pose_dir, actual_idx, tgt_row, obs_row)
+            if enable_annotations:
+                # 2. Mask render (pure-color, 1 sample)
+                originals = assign_mask_materials(sat_parts)
+                tmp_exr = os.path.join(mask_dir, f'_tmp_{fname}.exr')
+                mask = render_mask_image(resolution, samples, tmp_exr)
+                restore_materials(sat_parts, originals)
+
+                # Save mask PNG
+                save_mask_png(mask, os.path.join(mask_dir, f'{fname}.png'))
+
+                # 3. Extract annotations from mask
+                img_entry, ann_entries, yolo_lines, ann_id = mask_to_annotations(
+                    mask, var_frame_id, f'{fname}.png', ann_id)
+                coco_images.append(img_entry)
+                coco_annotations.extend(ann_entries)
+                with open(os.path.join(yolo_dir, f'{fname}.txt'), 'w') as f:
+                    f.write('\n'.join(yolo_lines) + ('\n' if yolo_lines else ''))
+
+                # 4. Pose ground truth (with perturbed quaternion)
+                write_pose_file(pose_dir, actual_idx, tgt_row, obs_row,
+                                perturb_quat=perturb, var_idx=var_idx)
+
+        # Progress per original frame
+        if frame_idx % 10 == 0 or frame_idx == num_render - 1:
+            progress = (frame_idx + 1) / num_render * 100
+            print(f"  [{frame_idx + 1}/{num_render}] {progress:.0f}% - Frame {actual_idx}"
+                  f" ({num_variations} vars)")
 
     print(f"\n--- Rendering Complete ---")
     print(f"Images: {image_dir}")

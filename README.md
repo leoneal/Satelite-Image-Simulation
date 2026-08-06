@@ -92,6 +92,18 @@ blender -b -P blender/render_scene.py -- \
   --tag "segA_DSP_stare_22482_23165_s32_r2048_x10"
 ```
 
+### 数据扩增
+
+支持两种渲染时扩增手段，可叠加使用：
+
+```powershell
+# 姿态扩增 + 光照变化：每帧 10 姿态 × 4 光照 = 40 变体
+blender -b -P blender/render_scene.py -- \
+  --frame_variations 10 --attitude_jitter_deg 90 \
+  --sun_phase_offsets "60,120,180" \
+  ... (其他参数)
+```
+
 ### CLI 参数
 
 | 参数 | 默认值 | 说明 |
@@ -107,6 +119,10 @@ blender -b -P blender/render_scene.py -- \
 | `--model_scale` | 1.0 | 模型缩放倍数 |
 | `--tag` | auto | 输出子文件夹名 |
 | `--no_annotations` | false | 跳过标注生成 |
+| `--frame_variations` | 1 | 每帧姿态变体数量 |
+| `--attitude_jitter_deg` | 0 | 最大随机姿态扰动角度 |
+| `--sun_phase_offsets` | 空 | 太阳相位偏移，如 `"60,120,180"` |
+| `--sun_energy_range` | 空 | 太阳能量范围，如 `"100,300"` |
 
 ## 仿真分段
 
@@ -119,6 +135,15 @@ blender -b -P blender/render_scene.py -- \
 ## 标注格式
 
 支持 COCO (检测 + RLE 分割)、YOLO、位姿真值。5 个标注类别：body、solar_panel、phased_array_antenna、reflector_antenna、solar_panel_tripod。
+
+## 数据集工具
+
+| 工具 | 用途 |
+|------|------|
+| `tools/point_target_generator.py` | 分析式点目标图像生成（无 Blender 依赖，~1000 帧/秒） |
+| `tools/dataset_builder.py` | 将渲染批次打包为统一数据集（索引模式） |
+| `tools/compute_point_labels.py` | 从星历计算亚像素坐标（纯几何） |
+| `tools/build_coco.py` | 从 mask PNG 重建 COCO 标注 |
 
 ## 文档
 

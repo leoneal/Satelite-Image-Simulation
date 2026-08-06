@@ -29,7 +29,10 @@
 ├── tools/
 │   ├── build_coco.py             从 mask PNG 重建 COCO 标注
 │   ├── compute_point_labels.py   亚像素点坐标分析
-│   └── md2docx.py                Markdown → Word 转换
+│   ├── dataset_builder.py        数据集打包（索引模式）
+│   ├── md2docx.py                Markdown → Word 转换
+│   ├── point_target_generator.py 分析式点目标图像生成
+│   └── verify_conversion.py      轨道数据转换验证
 ├── data/
 │   ├── earth_textures/           地球贴图 (8K Blue Marble)
 │   ├── sat_models/DSP/           卫星 3D 模型 (FBX)
@@ -136,14 +139,16 @@ blender -b -P blender/render_scene.py -- \
 
 支持 COCO (检测 + RLE 分割)、YOLO、位姿真值。5 个标注类别：body、solar_panel、phased_array_antenna、reflector_antenna、solar_panel_tripod。
 
-## 数据集工具
+## 工具
 
 | 工具 | 用途 |
 |------|------|
-| `tools/point_target_generator.py` | 分析式点目标图像生成（无 Blender 依赖，~1000 帧/秒） |
+| `tools/point_target_generator.py` | 分析式点目标图像生成（无 Blender 依赖） |
 | `tools/dataset_builder.py` | 将渲染批次打包为统一数据集（索引模式） |
 | `tools/compute_point_labels.py` | 从星历计算亚像素坐标（纯几何） |
 | `tools/build_coco.py` | 从 mask PNG 重建 COCO 标注 |
+| `tools/md2docx.py` | Markdown → Word 文档转换 |
+| `tools/verify_conversion.py` | 轨道数据 kepler2cart 转换验证 |
 
 ## 文档
 

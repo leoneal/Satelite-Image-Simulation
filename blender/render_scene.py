@@ -959,7 +959,9 @@ def mask_to_annotations(mask, frame_id, image_filename, ann_id_start):
             continue
         binary = (mask == pixval)
         area = int(binary.sum())
-        if area == 0:
+        # Category-dependent area filter: small components need lower threshold
+        min_area = 5 if cat_id in (3, 4, 5) else 30  # 30px for body/panel, 5px for antenna/tripod
+        if area < min_area:
             continue
 
         ys, xs = np.nonzero(binary)

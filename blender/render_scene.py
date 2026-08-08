@@ -635,9 +635,20 @@ def setup_stars(camera):
 
 
 def setup_render(samples):
-    """Configure Cycles render settings"""
+    """Configure Cycles render settings with GPU (OptiX) acceleration."""
     scene = bpy.context.scene
     scene.render.engine = 'CYCLES'
+
+    # GPU rendering (OptiX for RTX cards, ~5-10x faster than CPU)
+    prefs = bpy.context.preferences.addons['cycles'].preferences
+    prefs.refresh_devices()
+    prefs.compute_device_type = 'OPTIX'
+    scene.cycles.device = 'GPU'
+    # Enable all GPU devices
+    for dev in prefs.devices:
+        dev.use = dev.type == 'OPTIX'
+    print(f'  Render device: GPU (OptiX), {sum(1 for d in prefs.devices if d.use)} device(s)')
+
     scene.cycles.samples = samples
     scene.cycles.use_denoising = False  # Denoising kills small satellite targets
     scene.cycles.use_adaptive_sampling = False

@@ -66,6 +66,9 @@ def parse_args():
                         help='Comma-separated sun phase offsets in degrees (e.g. "30,90,150")')
     parser.add_argument('--sun_energy_range', type=str, default='',
                         help='Sun energy range "min,max" for random sampling (e.g. "40,120")')
+    parser.add_argument('--render_device', type=str, default='gpu',
+                        choices=['gpu', 'cpu'],
+                        help='Render device: gpu (OptiX) or cpu')
     return parser.parse_args(argv)
 
 
@@ -634,20 +637,24 @@ def setup_stars(camera):
     print('  Stars: backdrop plane with celestial-rotation compensation')
 
 
-def setup_render(samples):
-    """Configure Cycles render settings with GPU (OptiX) acceleration."""
+def setup_render(samples, render_device='gpu'):
+    """Configure Cycles render settings."""
     scene = bpy.context.scene
     scene.render.engine = 'CYCLES'
 
-    # GPU rendering (OptiX for RTX cards, ~5-10x faster than CPU)
-    prefs = bpy.context.preferences.addons['cycles'].preferences
-    prefs.refresh_devices()
-    prefs.compute_device_type = 'OPTIX'
-    scene.cycles.device = 'GPU'
-    # Enable all GPU devices
-    for dev in prefs.devices:
-        dev.use = dev.type == 'OPTIX'
-    print(f'  Render device: GPU (OptiX), {sum(1 for d in prefs.devices if d.use)} device(s)')
+    if render_device == 'gpu':
+        prefs = bpy.context.preferences.addons['cycles'].preferences
+        prefs.refresh_devices()
+        prefs.compute_device_type = 'OPTIX'
+        scene.cycles.device = 'GPU'
+        for dev in prefs.devices:
+            dev.use = dev.type == 'OPTIX'
+        scene.cycles.tile_size = 2048  # large tiles for GPU
+        print(f'  Render device: GPU (OptiX), {sum(1 for d in prefs.devices if d.use)} device(s)')
+    else:
+        scene.cycles.device = 'CPU'
+        scene.cycles.tile_size = 64
+        print(f'  Render device: CPU')
 
     scene.cycles.samples = samples
     scene.cycles.use_denoising = False  # Denoising kills small satellite targets
@@ -1090,7 +1097,7 @@ def main():
     camera = setup_camera(fov_deg, resolution, camera_mode)
     sun_light, sun_target = setup_sun()
     setup_stars(camera)
-    setup_render(samples)
+    setup_render(samples, args.render_device)
 
     bpy.context.scene.camera = camera
 

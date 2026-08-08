@@ -126,6 +126,7 @@ blender -b -P blender/render_scene.py -- \
 | `--attitude_jitter_deg` | 0 | 最大随机姿态扰动角度 |
 | `--sun_phase_offsets` | 空 | 太阳相位偏移，如 `"60,120,180"` |
 | `--sun_energy_range` | 空 | 太阳能量范围，如 `"100,300"` |
+| `--render_device` | gpu | `gpu` (OptiX) / `cpu` |
 
 ## 仿真分段
 

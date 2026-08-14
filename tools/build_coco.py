@@ -19,10 +19,25 @@ import zlib
 import struct
 import numpy as np
 
-# pixel → COCO category mapping
+# pixel → COCO category mapping.
+# NEW encoding (default): PNG values are raw values × 50 (save_mask_png scale,
+# capped at 250): 50 -> body(1), 100 -> panel(2), 150 -> panel(3), ... 250 -> panel(5+)
+# LEGACY encoding (--legacy): raw values directly (v1.0 masks):
+#   1=body, 2-99=panel, 100-149=phased, 150-199=reflector, 200-249=tripod
 KNOWN_PIXELS = [1, 2, 3, 4, 5, 100, 150, 200]
-def pixel_to_category(pix):
-    near = min(KNOWN_PIXELS, key=lambda k: abs(k - pix))
+
+def pixel_to_category(pix, legacy=False):
+    if pix == 0:
+        return None
+    if legacy:
+        raw = pix
+    else:
+        raw = pix // 50
+        if raw < 1:
+            raw = 1
+        if raw > 5:
+            raw = 5
+    near = min(KNOWN_PIXELS, key=lambda k: abs(k - raw))
     if near == 1: return 1
     if 2 <= near <= 99: return 2
     if 100 <= near <= 149: return 3
@@ -73,7 +88,7 @@ def rle_encode(binary_mask):
     return {"size": list(binary_mask.shape), "counts": runs.tolist()}
 
 
-def main(mask_dir, out_dir, val_stride=5):
+def main(mask_dir, out_dir, val_stride=5, legacy=False):
     # Collect mask PNGs from mask_dir and all batch subdirectories
     mask_files = []  # (frame_id, full_path, file_name)
     def collect(d):
@@ -112,7 +127,7 @@ def main(mask_dir, out_dir, val_stride=5):
         })
 
         for pixval in range(1, 256):
-            cat_id = pixel_to_category(pixval)
+            cat_id = pixel_to_category(pixval, legacy=legacy)
             if cat_id is None:
                 continue
             binary = (mask == pixval)
@@ -176,8 +191,10 @@ if __name__ == '__main__':
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     mask_dir = os.path.join(root, 'output', 'annotations', 'instance_masks')
     out_dir = os.path.join(root, 'output', 'annotations')
-    if len(sys.argv) > 1:
-        mask_dir = sys.argv[1]
-    if len(sys.argv) > 2:
-        out_dir = sys.argv[2]
-    main(mask_dir, out_dir)
+    legacy = '--legacy' in sys.argv
+    args = [a for a in sys.argv[1:] if a != '--legacy']
+    if len(args) > 0:
+        mask_dir = args[0]
+    if len(args) > 1:
+        out_dir = args[1]
+    main(mask_dir, out_dir, legacy=legacy)

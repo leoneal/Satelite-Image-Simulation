@@ -11,17 +11,17 @@ EPHEM_DIR = os.path.join(PROJECT, "dataset", "segB_v2", "ephemeris")
 
 # ======== Batch definitions ========
 BATCHES = [
-    # (tag, start, end, stride, model_type, model_scale, frame_variations, jitter, sun, samples, res, fov, mode)
+    # (tag, start, end, stride, model_type, model_scale, frame_vars, jitter, sun, samples, res, fov, mode, sat_class_id)
     # Batch 1: DSP < 70km
-    ("dsp_lt70km",  172021, 190621, 62,  "dsp_blend", 1.0, 5, 90, "60,120", 64, 2048, 0.08, "track"),
-    # Batch 2: DSP 70-250km (two ranges: approaching and departing)
-    ("dsp_70_250km",      0, 172021, 352, "dsp_blend", 1.0, 5, 90, "60,120", 64, 2048, 0.08, "track"),
-    ("dsp_70_250km", 190593, 362402, 352, "dsp_blend", 1.0, 5, 90, "60,120", 64, 2048, 0.08, "track"),
+    ("dsp_lt70km",  172021, 190621, 62,  "dsp_blend", 1.0, 5, 90, "60,120", 64, 2048, 0.08, "track", None),
+    # Batch 2: DSP 70-250km
+    ("dsp_70_250km",      0, 172021, 352, "dsp_blend", 1.0, 5, 90, "60,120", 64, 2048, 0.08, "track", None),
+    ("dsp_70_250km", 190593, 362402, 352, "dsp_blend", 1.0, 5, 90, "60,120", 64, 2048, 0.08, "track", None),
     # Batch 3: Simple < 70km
-    ("sim_lt70km",   172021, 190621, 62,  "simple",    1.0, 5, 90, "60,120", 64, 2048, 0.08, "track"),
+    ("sim_lt70km",   172021, 190621, 62,  "simple",    1.0, 5, 90, "60,120", 64, 2048, 0.08, "track", None),
     # Batch 4: Simple 70-250km
-    ("sim_70_250km",      0, 172021, 352, "simple",    1.0, 5, 90, "60,120", 64, 2048, 0.08, "track"),
-    ("sim_70_250km", 190593, 362402, 352, "simple",    1.0, 5, 90, "60,120", 64, 2048, 0.08, "track"),
+    ("sim_70_250km",      0, 172021, 352, "simple",    1.0, 5, 90, "60,120", 64, 2048, 0.08, "track", None),
+    ("sim_70_250km", 190593, 362402, 352, "simple",    1.0, 5, 90, "60,120", 64, 2048, 0.08, "track", None),
 ]
 
 SUB_BATCH_SIZE = 50  # frames per Blender invocation (GPU: ~10 min for 50×15 combos)
@@ -47,7 +47,8 @@ def get_last_rendered_frame(tag, required_vars=15):
 
 
 def run_sub_batch(tag, start, end, stride, model_type, model_scale,
-                  frame_vars, jitter, sun, samples, res, fov, mode):
+                  frame_vars, jitter, sun, samples, res, fov, mode,
+                  sat_class_id=None):
     """Run a single Blender sub-batch."""
     args = [
         "--ephem_dir", EPHEM_DIR,
@@ -62,6 +63,8 @@ def run_sub_batch(tag, start, end, stride, model_type, model_scale,
         "--render_device", "gpu",
         "--tag", tag,
     ]
+    if sat_class_id is not None:
+        args += ["--sat_class_id", str(sat_class_id)]
     if frame_vars > 1:
         args += ["--frame_variations", str(frame_vars),
                  "--attitude_jitter_deg", str(jitter)]
@@ -82,7 +85,7 @@ def run_sub_batch(tag, start, end, stride, model_type, model_scale,
 
 
 def main():
-    for tag, start, end, stride, model_type, model_scale, frame_vars, jitter, sun, samples, res, fov, mode in BATCHES:
+    for tag, start, end, stride, model_type, model_scale, frame_vars, jitter, sun, samples, res, fov, mode, sat_class_id in BATCHES:
         total = len(range(start, end, stride))
         if total == 0:
             continue
@@ -112,7 +115,7 @@ def main():
 
             ok = run_sub_batch(tag, next_start, sub_end, stride,
                               model_type, model_scale, frame_vars, jitter, sun,
-                              samples, res, fov, mode)
+                              samples, res, fov, mode, sat_class_id)
             print("OK" if ok else "FAILED")
             if not ok:
                 break

@@ -69,6 +69,16 @@ def parse_args():
     parser.add_argument('--render_device', type=str, default='gpu',
                         choices=['gpu', 'cpu'],
                         help='Render device: gpu (OptiX) or cpu')
+    parser.add_argument('--sat_class_id', type=int, default=None,
+                        help='Satellite model class ID for YOLO detection label '
+                             '(0-based, added as extra line per frame)')
+    parser.add_argument('--fbx_path', type=str, default=None,
+                        help='Path to FBX model file (overrides default)')
+    parser.add_argument('--blend_path', type=str, default=None,
+                        help='Path to user-annotated .blend model (takes priority; '
+                             'textures are linked from fbx_path directory)')
+    parser.add_argument('--output_root', type=str, default=None,
+                        help='Override output root directory (default: dirname of ephem_dir)')
     return parser.parse_args(argv)
 
 
@@ -299,6 +309,181 @@ def _center_and_scale_to_km(meshes, model_scale=1.0):
     print(f'  Model centered, km-scale: max dim {max(dims)*1000:.1f}m{scale_str}')
 
 
+def _load_fbx_textures(fbx_path, meshes):
+    """Create textured materials for each FBX mesh: BSDF + matched texture + emission.
+    Combines material creation and texture linking in one step for reliability."""
+    fbx_dir = os.path.dirname(os.path.abspath(fbx_path))
+    img_exts = ('.jpg', '.jpeg', '.png', '.tga', '.bmp', '.tif', '.tiff')
+    tex_files = sorted(f for f in os.listdir(fbx_dir)
+                       if os.path.splitext(f)[1].lower() in img_exts)
+    if not tex_files:
+        # No textures: fall back to colored emission materials
+        for obj in meshes:
+            comp_type = _classify_part(obj)[0]
+            _add_component_material(obj, comp_type)
+        return
+
+    loaded_imgs = []
+    for f in tex_files:
+        try:
+            img = bpy.data.images.load(os.path.join(fbx_dir, f))
+            loaded_imgs.append((f, img))
+        except Exception:
+            pass
+    if not loaded_imgs:
+        for obj in meshes:
+            _add_component_material(obj, _classify_part(obj)[0])
+        return
+
+    # Match textures to meshes by original FBX name.
+    # Texture naming varies across models. Common patterns:
+    #   Gold:    lvbo金色.jpg, 金箔.jpg                      (keyword: 金, gold)
+    #   Silver:  lvbo银色.jpg, 铝箔.jpg                      (keyword: 银, 铝, silver, alumin)
+    #   Solar:   Solar panel.jpg, 太阳能电池阵列.jpg, tyb.jpg (keyword: solar, panel, 太阳, 电池, tyb, slrpnls)
+    # Mesh names vary by modeler. Common patterns:
+    #   "Aluminizing", "Gold-plating", "Solar panel _front", "White paint"
+
+    def _tex_has(fname, *keywords):
+        return any(kw in os.path.splitext(fname)[0].lower() for kw in keywords)
+
+    for obj in meshes:
+        o_name = obj.get('fbx_original_name', obj.name).lower()
+
+        def _mesh_has(*keywords):
+            return any(kw in o_name for kw in keywords)
+
+        # Default to silver/aluminum (most neutral), fallback to first image
+        best_img = loaded_imgs[0][1]
+        for fname, img in loaded_imgs:
+            if _tex_has(fname, '银', 'silver', 'alumin', '铝'):
+                best_img = img; break
+
+        # Keyword matching: texture name ↔ mesh name
+        for fname, img in loaded_imgs:
+            # Solar panel
+            if _tex_has(fname, 'solar', 'panel', '太阳', '电池', 'tyb', 'slrpnls'):
+                if _mesh_has('solar', 'panel', '太阳', '电池', 'tyb', 'slrpnls'):
+                    best_img = img; break
+            # Gold
+            if _tex_has(fname, '金', 'gold'):
+                if _mesh_has('gold', '金'):
+                    best_img = img; break
+            # Silver/aluminum
+            if _tex_has(fname, '银', 'silver', 'alumin', '铝'):
+                if _mesh_has('alumin', '银', 'silver', '铝'):
+                    best_img = img; break
+
+        # Create material: textured BSDF + textured emission.
+        # KEY: emission Color MUST be driven by the texture, same as BSDF Base Color.
+        # Otherwise emission defaults to white and washes out all texture detail.
+        # DSP uses 5% emission to prevent pure-black shadows; FBX uses 30% so
+        # textures remain visible at km-scale distances where BSDF contribution is
+        # minimal (small target, limited pixel coverage).
+        mat = bpy.data.materials.new(obj.name + '_mat')
+        nodes = mat.node_tree.nodes; nodes.clear()
+
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.image = best_img
+        tex_node.interpolation = 'Linear'
+
+        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.inputs['Roughness'].default_value = 0.4
+        bsdf.inputs['Metallic'].default_value = 0.3
+
+        emit = nodes.new('ShaderNodeEmission')
+        emit.inputs['Strength'].default_value = 1.0
+
+        mix = nodes.new('ShaderNodeMixShader')
+        mix.inputs['Fac'].default_value = 0.30  # 30% emission — 6× DSP but preserves BSDF lighting
+
+        output = nodes.new('ShaderNodeOutputMaterial')
+        # Texture → BSDF base color
+        mat.node_tree.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+        # Texture → Emission color (critical: prevents white washout)
+        mat.node_tree.links.new(tex_node.outputs['Color'], emit.inputs['Color'])
+        # BSDF → Mix input 1 (bottom), Emission → Mix input 2 (top)
+        mat.node_tree.links.new(bsdf.outputs['BSDF'], mix.inputs[1])
+        mat.node_tree.links.new(emit.outputs['Emission'], mix.inputs[2])
+        # Mix → Output
+        mat.node_tree.links.new(mix.outputs['Shader'], output.inputs['Surface'])
+
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
+
+    print(f'  Textures linked: {len(loaded_imgs)} image(s) from FBX directory')
+
+
+def _split_panel_meshes(meshes):
+    """Split solar panel meshes spanning both sides of x=0 into left/right halves.
+
+    Many 3ds Max models store BOTH wings in a single mesh (vertices span x<0
+    and x>0). Splitting at the model center (x=0, after centering) produces
+    two wing instances. Front/back faces of the same physical wing are
+    co-located meshes with 'front'/'back' in their names — they are grouped
+    so they share one instance ID (only the facing side is visible at once).
+    """
+    panels = [o for o in meshes
+              if 'solar' in o.name.lower() or 'panel' in o.name.lower()]
+    if not panels:
+        return
+
+    # Step 1: split panels spanning both sides of x=0
+    for obj in list(panels):
+        xs = [v.co.x for v in obj.data.vertices]
+        if min(xs) > -1e-6 or max(xs) < 1e-6:
+            continue  # single-sided wing, no split
+
+        other = obj.copy()
+        other.data = obj.data.copy()
+        bpy.context.collection.objects.link(other)
+
+        # obj keeps x<0 (left), other keeps x>0 (right). Bisect preserves UVs.
+        for target, clear_inner, clear_outer, side in (
+                (obj, False, True, 'left'),
+                (other, True, False, 'right')):
+            bpy.ops.object.select_all(action='DESELECT')
+            target.select_set(True)
+            bpy.context.view_layer.objects.active = target
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.bisect(plane_co=(0, 0, 0), plane_no=(1, 0, 0),
+                                clear_inner=clear_inner, clear_outer=clear_outer)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            target['panel_side'] = side
+            target.select_set(False)
+
+        panels.append(other)
+        meshes.append(other)
+
+    # Step 2: group front/back faces of the same wing by (base_name, side).
+    # e.g. "Solar panel _front" / "Solar panel _back" → same group per side.
+    # ONLY meshes with 'front'/'back' in the name are grouped — distinct
+    # user-named panels (e.g. 'panel _1', 'panel _2') stay separate instances.
+    groups = {}
+    for obj in panels:
+        n = obj.get('fbx_original_name', obj.name).lower()
+        had_suffix = False
+        for suffix in ('back', 'front'):
+            if suffix in n:
+                n = n.replace(suffix, '')
+                had_suffix = True
+                break
+        if had_suffix:
+            base = n.strip(' _0123456789')
+            side = obj.get('panel_side', '')
+            groups.setdefault((base, side), []).append(obj)
+        else:
+            # Distinct user-named panel → its own group (id() keeps it unique)
+            groups.setdefault(('user', id(obj)), []).append(obj)
+
+    # Step 3: assign instance IDs, ordered left-to-right for determinism
+    ordered = sorted(groups.items(), key=lambda kv: min(
+        min((v.co.x for v in o.data.vertices), default=0.0) for o in kv[1]))
+    for gid, (_key, objs) in enumerate(ordered, start=1):
+        for obj in objs:
+            obj['panel_group'] = gid
+
+
 def _load_fbx_model(fbx_path, model_scale=1.0):
     """Load single-mesh FBX model with proper transform baking."""
     pre_import = set(bpy.data.objects)
@@ -338,26 +523,51 @@ def _load_fbx_model(fbx_path, model_scale=1.0):
     # Step 4: Center geometry, scale to km
     _center_and_scale_to_km(meshes, model_scale)
 
-    # Step 5: FBX is a single merged mesh — classify as 'body'
-    # (User should use DSP.blend for per-component rendering)
+    # Step 5: Classify components, assign pass_index, preserve original FBX materials
+    # FBX materials (with textures) are kept for beauty rendering.
+    # Mask rendering uses assign_mask_materials which swaps to pure emission colors.
+    # Step 5: Classify parts, assign textured materials
+    # Save original names before renaming
+    for obj in meshes:
+        obj['fbx_original_name'] = obj.name
+
+    # Split merged solar panel meshes into left/right wing instances.
+    # Many 3ds Max models store BOTH wings in one mesh (spanning x=0),
+    # and store front/back faces as separate co-located meshes. Split at x=0
+    # and group front/back of the same wing into one instance.
+    _split_panel_meshes(meshes)
+
     panel_idx = 1
     for obj in meshes:
         comp_type, base_idx = _classify_part(obj)
-        # Override: single-mesh FBX → all is 'default' (one instance)
         if comp_type == 'panel':
-            obj.pass_index = base_idx + panel_idx - 1
-            obj.name = f'panel_{panel_idx}'; panel_idx += 1
+            if 'panel_group' in obj:
+                gid = obj['panel_group']
+            else:
+                gid = panel_idx
+            obj.pass_index = base_idx + gid - 1
+            obj.name = f'panel_{gid}'
+            panel_idx += 1
         else:
             obj.pass_index = 1
             obj.name = 'body'
-        _add_component_material(obj, comp_type)
+
+    # Load textures from FBX directory
+    _load_fbx_textures(fbx_path, meshes)
 
     print(f'  Satellite: FBX loaded ({len(meshes)} mesh(es), transforms baked)')
     return meshes
 
 
-def _load_blend_model(blend_path, model_scale=1.0):
-    """Load user-separated DSP.blend model with proper transform baking."""
+def _load_blend_model(blend_path, model_scale=1.0, fbx_path=None):
+    """Load user-annotated .blend model with proper transform baking.
+    fbx_path (optional): directory source for texture linking — textures are
+    matched by the user's mesh names (e.g. 'Gold-plating', 'panel_1')."""
+    # Blender resolves relative library paths against the process cwd, which
+    # is unreliable on Windows (may end up at a drive root). Force absolute.
+    blend_path = os.path.abspath(blend_path)
+    if fbx_path:
+        fbx_path = os.path.abspath(fbx_path)
     with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
         data_to.objects = data_from.objects
 
@@ -402,10 +612,17 @@ def _load_blend_model(blend_path, model_scale=1.0):
     _center_and_scale_to_km(meshes, model_scale)
 
     # Step 6: Separate full model from labeled parts.
-    # Full model (1323_00): used for beauty RGB renders (complete geometry).
-    # Labeled parts: used for instance segmentation masks (user-annotated components).
-    # Both are hidden/shown as needed: beauty → full visible, parts hidden.
-    #                                  mask   → full hidden, parts visible.
+    # Full model (digit-first name, legacy DSP.blend convention): used for
+    # beauty RGB renders (complete geometry). New satellite .blend files do
+    # NOT use this — all parts render in both beauty and mask.
+    # Save user names for texture matching before renaming
+    for obj in meshes:
+        obj['fbx_original_name'] = obj.name
+
+    # Split merged solar panel meshes into left/right wing instances (same
+    # logic as FBX path; user-split single-sided meshes are skipped).
+    _split_panel_meshes(meshes)
+
     full_model = None
     panel_idx, phased_idx, reflector_idx, tripod_idx = 1, 1, 1, 1
     labeled = []
@@ -422,8 +639,13 @@ def _load_blend_model(blend_path, model_scale=1.0):
             labeled.append(obj)
             comp_type, base_idx = _classify_part(obj)
             if comp_type == 'panel':
-                obj.pass_index = base_idx + panel_idx - 1
-                obj.name = f'panel_{panel_idx}'; panel_idx += 1
+                if 'panel_group' in obj:
+                    gid = obj['panel_group']
+                else:
+                    gid = panel_idx
+                obj.pass_index = base_idx + gid - 1
+                obj.name = f'panel_{gid}'
+                panel_idx += 1
             elif comp_type == 'phased':
                 obj.pass_index = base_idx + phased_idx - 1
                 obj.name = f'antenna_phased_{phased_idx}'; phased_idx += 1
@@ -436,8 +658,17 @@ def _load_blend_model(blend_path, model_scale=1.0):
             else:
                 obj.pass_index = 1
                 obj.name = 'body'
-            _add_component_material(obj, comp_type)
-            obj.hide_render = False  # visible for beauty (together with full model)
+            obj.hide_render = False  # visible for beauty
+
+    # Textures: if fbx_path given, link textures matched by user mesh names.
+    # Otherwise fall back to solid colors (legacy DSP.blend behavior).
+    if fbx_path and os.path.exists(fbx_path):
+        _load_fbx_textures(fbx_path, meshes)
+    else:
+        for obj in labeled:
+            _add_component_material(obj, _classify_part(obj)[0])
+        if full_model:
+            _add_component_material(full_model, 'default')
 
     # Return: full model first (if exists), then labeled parts
     result = ([full_model] if full_model else []) + labeled
@@ -499,35 +730,46 @@ def _build_simple_model(model_scale=1.0):
     return parts
 
 
-def create_satellite_model(model_scale=1.0, model_type='auto'):
+def create_satellite_model(model_scale=1.0, model_type='auto', fbx_path=None,
+                           blend_path=None):
     """
     Load satellite model.
 
     model_type:
-      - 'auto':      auto-detect (try DSP.blend, then FBX, then simple)
-      - 'dsp_blend': force DSP.blend (user-separated components + full model)
+      - 'auto':      auto-detect (try .blend if given, then FBX, then simple)
+      - 'dsp_blend': force .blend (user-annotated components + full model)
       - 'simple':    force simple geometric primitives
 
-    All paths produce flat lists of independent meshes with identity transforms,
-    vertices in km units centered at origin.
+    fbx_path: optional path to a specific FBX file (overrides default).
+    blend_path: optional path to a user-annotated .blend (textures come from
+        fbx_path's directory).
     """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    blend_path = os.path.join(project_root, 'output', 'DSP.blend')
-    fbx_path = os.path.join(project_root, 'data', 'sat_models', 'DSP', '1323.fbx')
+    default_blend = os.path.join(project_root, 'output', 'blend_files', 'DSP.blend')
+    default_fbx = os.path.join(project_root, 'data', 'sat_models', 'DSP', '1323.fbx')
+    effective_fbx = fbx_path if fbx_path and os.path.exists(fbx_path) else default_fbx
 
     if model_type == 'simple':
         return _build_simple_model(model_scale)
     elif model_type == 'dsp_blend':
-        if os.path.exists(blend_path):
-            return _load_blend_model(blend_path, model_scale)
+        effective_blend = blend_path if blend_path else default_blend
+        if os.path.exists(effective_blend):
+            # fbx_path (raw arg, may be None) is only used for texture linking;
+            # None → solid colors (legacy DSP appearance)
+            return _load_blend_model(effective_blend, model_scale, fbx_path)
         else:
-            print(f'  DSP.blend not found at {blend_path}, falling back to simple')
+            print(f'  .blend not found ({effective_blend}), falling back to simple')
             return _build_simple_model(model_scale)
     else:  # auto
-        if os.path.exists(blend_path):
-            return _load_blend_model(blend_path, model_scale)
-        elif os.path.exists(fbx_path):
+        # User-annotated .blend takes priority over raw FBX
+        if blend_path and os.path.exists(blend_path):
+            return _load_blend_model(blend_path, model_scale, fbx_path)
+        if fbx_path and os.path.exists(fbx_path):
             return _load_fbx_model(fbx_path, model_scale)
+        if os.path.exists(default_blend):
+            return _load_blend_model(default_blend, model_scale)
+        elif os.path.exists(effective_fbx):
+            return _load_fbx_model(effective_fbx, model_scale)
         else:
             return _build_simple_model(model_scale)
 
@@ -792,6 +1034,12 @@ def update_frame(obs_row, tgt_row, sun_row, camera, sat_parts, sun_light, sun_ta
     sun_light.rotation_quaternion = rot_sun.to_quaternion()
     sun_target.location = Vector((0, 0, 0))
 
+    # Return per-frame influencing factors for the factors CSV annotation:
+    # (observer-target distance km, actual sun phase angle deg)
+    cam_dir = rel_tgt.normalized()
+    sun_ang = math.degrees(math.acos(max(-1.0, min(1.0, cam_dir.dot(sun_dir)))))
+    return rel_tgt.length, sun_ang
+
 
 # ============================================================
 # Annotation generation (mask -> COCO/YOLO/pose)
@@ -835,8 +1083,17 @@ def build_mask_material(name, pixel_value):
 
 def assign_mask_materials(sat_parts):
     """Swap each label part for mask color. Full model (is_full_model) is hidden;
-    label parts are shown and get pure-emission mask materials."""
+    label parts are shown and get pure-emission mask materials.
+    Star backdrop and Earth are hidden so the mask is pure black + satellite."""
     originals = {}
+    # Hide all non-satellite renderable objects (star backdrop, earth) so
+    # mask images contain ONLY satellite pixels. Save previous visibility.
+    hidden_others = {}
+    for obj in bpy.data.objects:
+        if obj.type in ('MESH', 'CURVE', 'SURFACE') and obj not in sat_parts:
+            hidden_others[obj.name] = obj.hide_render
+            obj.hide_render = True
+
     for part in sat_parts:
         if part.type != 'MESH':
             continue
@@ -852,11 +1109,19 @@ def assign_mask_materials(sat_parts):
             originals[part.name] = [m for m in part.data.materials]
             part.data.materials.clear()
             part.data.materials.append(build_mask_material(f'mask_{part.name}', pixval))
-    return originals
+    return originals, hidden_others
 
 
-def restore_materials(sat_parts, originals):
-    """Restore beauty materials. Full model is shown; label parts are hidden."""
+def restore_materials(sat_parts, originals, hidden_others=None):
+    """Restore beauty materials. Full model is shown; star backdrop/earth restored."""
+    # Restore previous visibility of non-satellite objects (star backdrop, earth)
+    for obj in bpy.data.objects:
+        if obj.type in ('MESH', 'CURVE', 'SURFACE') and obj not in sat_parts:
+            if hidden_others is not None and obj.name in hidden_others:
+                obj.hide_render = hidden_others[obj.name]
+            else:
+                obj.hide_render = False
+
     for part in sat_parts:
         if part.type != 'MESH':
             continue
@@ -913,10 +1178,17 @@ def render_mask_image(resolution, samples_backup, tmp_exr_path):
     return mask
 
 
-def save_mask_png(mask, filepath):
-    """Save uint8 mask as 8-bit grayscale PNG (pure stdlib, no Blender image API)."""
+def save_mask_png(mask, filepath, scale=50):
+    """Save uint8 mask as 8-bit grayscale PNG (pure stdlib, no Blender image API).
+    Values are scaled by `scale` (default 50) so instance IDs 1-5 are visible
+    in the PNG (1->50, 2->100, 3->150, ...), capped at 250. 0 stays 0 (background).
+    Decode with value // scale (see build_coco.py)."""
     import zlib, struct
     h, w = mask.shape
+    # Scale for visibility. Must widen to uint16 first: mask * 50 overflows
+    # uint8 (150*50=7500 wraps to 76), corrupting large instance values.
+    scaled = np.minimum(mask.astype(np.uint16) * scale, 250).astype(np.uint8)
+    mask = scaled
     # PNG signature
     sig = b'\x89PNG\r\n\x1a\n'
     # IHDR: width, height, bitdepth=8, colortype=0 (grayscale), compression=0, filter=0, interlace=0
@@ -978,7 +1250,7 @@ def mask_to_annotations(mask, frame_id, image_filename, ann_id_start):
         binary = (mask == pixval)
         area = int(binary.sum())
         # Category-dependent area filter: small components need lower threshold
-        min_area = 5 if cat_id in (3, 4, 5) else 30  # 30px for body/panel, 5px for antenna/tripod
+        min_area = 2 if cat_id in (3, 4, 5) else 30  # 30px body/panel, 2px antenna/tripod
         if area < min_area:
             continue
 
@@ -1076,8 +1348,11 @@ def main():
     batch_tag = args.tag if args.tag else f'{start_frame}_{end_frame-1}_s{samples}_r{resolution}'
 
     # Output directories
-    ephem_abs = os.path.abspath(args.ephem_dir)
-    output_root = os.path.normpath(os.path.dirname(ephem_abs))
+    if args.output_root:
+        output_root = os.path.abspath(args.output_root)
+    else:
+        ephem_abs = os.path.abspath(args.ephem_dir)
+        output_root = os.path.normpath(os.path.dirname(ephem_abs))
     image_dir = os.path.join(output_root, 'images', batch_tag)
     mask_dir = os.path.join(output_root, 'annotations', 'instance_masks', batch_tag)
     pose_dir = os.path.join(output_root, 'annotations', 'pose', batch_tag)
@@ -1093,7 +1368,8 @@ def main():
     # Build scene
     print("\n--- Building Scene ---")
     earth = create_earth()
-    sat_parts = create_satellite_model(args.model_scale, args.model_type)
+    sat_parts = create_satellite_model(args.model_scale, args.model_type,
+                                       args.fbx_path, args.blend_path)
     camera = setup_camera(fov_deg, resolution, camera_mode)
     sun_light, sun_target = setup_sun()
     setup_stars(camera)
@@ -1105,6 +1381,7 @@ def main():
     coco_images = []
     coco_annotations = []
     ann_id = 1
+    factors_rows = []  # per-image influencing factors (distance, sun angle, energy)
 
     # Render loop — build combination matrix for attitude × sun variations
     num_attitude_vars = max(1, args.frame_variations)
@@ -1177,21 +1454,32 @@ def main():
             else:
                 fname = f'frame_{actual_idx:04d}_v{combo_idx:03d}'
 
-            update_frame(obs_row, tgt_row, sun_row, camera, sat_parts,
-                         sun_light, sun_target, earth,
-                         perturb_quat=perturb, sun_phase_offset=sun_offset)
+            dist_km, sun_angle_deg = update_frame(
+                obs_row, tgt_row, sun_row, camera, sat_parts,
+                sun_light, sun_target, earth,
+                perturb_quat=perturb, sun_phase_offset=sun_offset)
 
             # 1. Beauty render (RGB)
             output_path = os.path.join(image_dir, f'{fname}.png')
             bpy.context.scene.render.filepath = output_path
             bpy.ops.render.render(write_still=True)
 
+            # 0. Record influencing factors (per-image conditions annotation)
+            factors_rows.append({
+                'filename': f'{fname}.png',
+                'frame_id': actual_idx,
+                'variation': combo_idx,
+                'distance_km': f'{dist_km:.3f}',
+                'sun_phase_angle_deg': f'{sun_angle_deg:.2f}',
+                'sun_energy': f'{sun_light.data.energy:.1f}',
+            })
+
             if enable_annotations:
                 # 2. Mask render (pure-color, 1 sample)
-                originals = assign_mask_materials(sat_parts)
+                originals, hidden_others = assign_mask_materials(sat_parts)
                 tmp_exr = os.path.join(mask_dir, f'_tmp_{fname}.exr')
                 mask = render_mask_image(resolution, samples, tmp_exr)
-                restore_materials(sat_parts, originals)
+                restore_materials(sat_parts, originals, hidden_others)
 
                 # Save mask PNG
                 save_mask_png(mask, os.path.join(mask_dir, f'{fname}.png'))
@@ -1201,6 +1489,18 @@ def main():
                     mask, var_frame_id, f'{fname}.png', ann_id)
                 coco_images.append(img_entry)
                 coco_annotations.extend(ann_entries)
+
+                # Add satellite model class label (full satellite bbox)
+                if args.sat_class_id is not None:
+                    h, w = mask.shape
+                    ys, xs = np.nonzero(mask)
+                    if len(xs) > 0:
+                        x0, x1 = int(xs.min()), int(xs.max())
+                        y0, y1 = int(ys.min()), int(ys.max())
+                        bw, bh = x1 - x0 + 1, y1 - y0 + 1
+                        yolo_lines.insert(0,
+                            f"{args.sat_class_id} {(x0 + bw/2)/w:.6f} {(y0 + bh/2)/h:.6f} {bw/w:.6f} {bh/h:.6f}")
+
                 with open(os.path.join(yolo_dir, f'{fname}.txt'), 'w') as f:
                     f.write('\n'.join(yolo_lines) + ('\n' if yolo_lines else ''))
 
@@ -1219,6 +1519,17 @@ def main():
 
     print(f"\n--- Rendering Complete ---")
     print(f"Images: {image_dir}")
+
+    # Write factors CSV (per-image influencing conditions)
+    if factors_rows:
+        factors_path = os.path.join(coco_dir, f'factors_{start_frame}_{end_frame-1}.csv')
+        with open(factors_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'filename', 'frame_id', 'variation',
+                'distance_km', 'sun_phase_angle_deg', 'sun_energy'])
+            writer.writeheader()
+            writer.writerows(factors_rows)
+        print(f"Factors CSV:          {factors_path} ({len(factors_rows)} rows)")
 
     # Write COCO JSON
     if enable_annotations and coco_images:

@@ -40,8 +40,24 @@ docs/stk_basics.md          STK 新手教程
 ### 已完成
 - 阶段 1-3：STK 连接、场景构建、星历导出
 - 阶段 4 核心渲染：**DSP 卫星模型 segA/B/C 三个子段全部渲染完成**
+- v1.1 数据集（15,000 张扩增）渲染中/已交付
+- 134 颗卫星 3ds Max 模型批量转 FBX + 纹理完备性检查（39 颗完备，报告见 docs/134卫星模型纹理检查报告.md）
+- v2.0 管线就绪：10 颗重点卫星选定、FBX 纹理加载、5 类部件标注流程验证（Beidou 完成）
 
-### 渲染结果
+### v2.0 数据集（进行中）
+- 10 颗卫星 × 200 帧 × 15 扩增（5 姿态 × 3 光照）= 30,000 张
+- 帧范围：<70km = 172020–190592 (stride 277, ~68 帧)；70–250km = 136787–172019 + 190593–225823 (stride 503, ~71+71 帧)
+- 输出：`dataset/v2.0/<sat_name>/{images,annotations}/`，标注含 COCO/YOLO/Pose/instance_masks
+- 渲染入口：`tools/render_loop_v2.py`（自动断点续传、自动检测 .blend）
+
+### 手动标注 .blend 约定（v2.0 5 类部件）
+- 用户手动标注后的 .blend 一律存 `output/blend_files/<name>.blend`（渲染循环自动检测）
+- **命名约定** `<Cat><idx>_<Name>`：NavSat(导航)/OptSat(光学遥感)/MicSat(微波遥感)/ComSat(通信) + 原模型分类内编号。如 `导航_1_Beidou-GEO` → `NavSat_1_Beidou-GEO.blend`
+- DSP.blend 也已移至 `output/blend_files/DSP.blend`
+- 5 类部件命名：body / 含 panel|solar / 含 phased|array / 含 reflector|dish / 含 tripod|truss
+- 详细流程：`docs/手动标注教程.md`
+
+### 渲染结果（v1.x 历史）
 
 | 段 | 帧数 | 模式 | FOV | 模型 | 路径 |
 |------|------|------|-----|------|------|
@@ -53,18 +69,22 @@ docs/stk_basics.md          STK 新手教程
 
 | 值 | 来源 | 说明 |
 |----|------|------|
-| `dsp_blend` | `output/DSP.blend` | 用户手动分离标注面 + 完整模型 `1323_00`（剩余面）。Beauty 渲染两者都可见，Mask 渲染只显示标注面 |
+| `dsp_blend` | `output/blend_files/DSP.blend` | 用户手动分离标注面 + 完整模型 `1323_00`（剩余面）。Beauty 渲染两者都可见，Mask 渲染只显示标注面 |
 | `simple` | Blender 几何体 | 手搭简易模型（5 部件：body + 2 panels + 2 antennas） |
-| `auto` | 自动检测 | 优先 DSP.blend → FBX → simple（默认） |
+| `auto` | 自动检测 | 优先 --blend_path → --fbx_path → DSP.blend → FBX → simple（默认） |
 
 ### 模型缩放（`--model_scale` CLI 参数）
 - segB：`--model_scale 1.0`（DSP 真实尺寸 ~6.3m，最近距离 307 px）
 - segA/segC：`--model_scale 10.0`（放大到 ~63m，让远距目标达到 0.5–2.1 px 可见）
+- v2.0 各卫星缩放以 DSP 6.3m 为基准归一化（定义在 tools/render_loop_v2.py SATELLITES 表）
 
 ### 其他 CLI 参数
 - `--fov`：相机视场角（默认 0.117°，segA/C 用 14°，segB 用 0.08°）
 - `--camera_mode`：`track`（追踪目标）或 `stare`（固定 ECI 指向，segA/C 使用）
 - `--no_annotations`：跳过标注生成（segA/C 使用，目标为亚像素点）
+- `--blend_path`：用户标注 .blend 路径（优先于 FBX）
+- `--output_root`：输出根目录覆盖（v2.0 用 dataset/v2.0/<sat_name>）
+- `--sat_class_id`：整星检测 YOLO 类别（v2.0 用 5-14，避开部件类 0-4）
 
 ## 关键约束（踩坑记录，必须遵守）
 
@@ -135,6 +155,15 @@ earth.location = -obs_pos          # 地球在 ~42164 km（精度需求低）
 - **`Render Result` 像素在第二次 `bpy.ops.render.render()`（无 write_still）后读取为空**——标注 mask 必须用 `write_still=True` 写临时 EXR 再 `bpy.data.images.load` 读回（EXR 保留 scene-linear 浮点）。
 - `bpy.data.images.new()` 创建的图像 pixels 为空，foreach_set 报 "expected sequence size 4, got 0"——mask PNG 用标准库 zlib/struct 手写编码，绕开 Blender image API。
 - **Operator 需要对象被选中才能生效**：`bpy.ops.object.parent_clear()` 和 `bpy.ops.object.transform_apply()` 操作的是**选中的对象**，仅设 `active` 不够，必须 `obj.select_set(True)`。
+- `bpy.ops.mesh.bisect()` **无 `fill` 参数**（Blender 5.2）。
+- `bpy.data.libraries.load()` 的相对路径在 Windows 上可能解析到盘符根目录（C:\...）——**必须先 `os.path.abspath()`**。`bpy.ops.import_scene.fbx` 无此问题。
+
+### 标注管线关键修复（v2.0）
+- **Mask 渲染必须隐藏星幕和地球**（`assign_mask_materials` 隐藏所有非卫星 mesh 并记录原可见性，`restore_materials` 恢复）——否则恒星像素污染 mask 和 COCO 标注。
+- **Mask PNG 值 ×50 保存**（1→50, 2→100, ...，cap 250）——原始值 1-5 在 8-bit 灰度图上视觉不可见。`build_coco.py` 解码用 `pix//50`，旧 v1.0 数据重建加 `--legacy`。
+- **FBX 太阳翼需拆分**：3ds Max 模型把左右两翼存在同一 mesh（顶点跨 x=0），front/back 面是同一块板的两个 co-located mesh。`_split_panel_meshes()` 在居中后用 bisect 按 x=0 切分，并按 (名字去 front/back 后缀, 左/右) 分组——正反面共享实例 ID。
+- **FBX 纹理匹配**：emission Color 必须连到纹理（否则白色洗掉纹理）；`os.listdir` 目录路径必须 `abspath`（中文相对路径静默失败）。
+- **YOLO 整星类别 id 用 5-14**，避开部件类 0-4（body/panel/phased/reflector/tripod）。
 
 ### 场景尺度
 - Blender 场景统一用 **km**（m×0.001），相机 clip_start=0.01 km (10m), clip_end=200000 km。

@@ -11,6 +11,8 @@ output/survey_batch_stride60/
 output/early_tests/
 output/*.blend
 output/*.blend1
+output/
+dataset/
 
 # Temp and cache
 *.pyc
@@ -46,3 +48,7 @@ data/
 orbit_data.xlsx
 # Public orbit data (distributed copy)
 orbit_data_public.xlsx
+
+# New orbit data (sensitive) and public handout
+轨道2.xlsx
+给钱室（公开）.xlsx

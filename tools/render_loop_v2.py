@@ -37,6 +37,8 @@ SATELLITES = [
     ("MicSat_03_3cosmo-skymed", "微波遥感卫星/微波_03_3cosmo-skymed/微波_03_3cosmo-skymed.fbx", 0.805, 12),
     ("ComSat_42-tdrs",          "通信卫星/通信_42-tdrs/42-tdrs-model.fbx",                0.489, 13),
     ("ComSat_47_wgs",           "通信卫星/通信_47_wgs/47_wgs_model.fbx",                  0.154, 14),
+    ("ComSat_30_Milstar",       "通信卫星/通信_30-Milstar/30-Milstar-model.fbx",          0.542, 16),
+    ("ComSat_3_AEHF",           "通信卫星/通信_3-AEHF/3-AEHF-model.fbx",                  0.307, 17),
     # DSP: legacy user-annotated model (DSP.blend, full model 1323_00 + parts).
     # fbx_rel None → solid colors, no texture linking.
     ("DSP",                     None,                                                      1.0,   15),
@@ -63,15 +65,22 @@ CAMERA_MODE = "track"
 MODEL_TYPE = "auto"  # will use --fbx_path to override
 REQUIRED_VARS = 15   # 5 attitude × 3 sun = 15 files per frame
 
-SUB_BATCH_SIZE = 50  # frames per Blender invocation
+SUB_BATCH_SIZE = 25  # frames per Blender invocation (smaller = more checkpoints)
+BATCH_TIMEOUT_S = 14400  # 4h per sub-batch — multi-mesh models render slowly
 
 
 def get_last_rendered_frame(sat_output_root, segment_tag, required_vars=REQUIRED_VARS):
-    """Get highest frame number where all variation files exist."""
+    """Get highest frame number where all variation files exist AND all
+    annotations (mask + yolo) are present. Checks both to avoid resuming
+    past frames whose annotation pass was killed mid-write."""
     img_dir = os.path.join(sat_output_root, "images", segment_tag)
     if not os.path.isdir(img_dir):
         return None
-    counts = Counter()
+    mask_dir = os.path.join(sat_output_root, "annotations",
+                            "instance_masks", segment_tag)
+    yolo_dir = os.path.join(sat_output_root, "annotations", "yolo", segment_tag)
+
+    img_counts = Counter()
     for f in os.listdir(img_dir):
         if f.startswith("frame_") and f.endswith(".png"):
             base = f.replace(".png", "")
@@ -79,8 +88,33 @@ def get_last_rendered_frame(sat_output_root, segment_tag, required_vars=REQUIRED
                 fid = int(base.split("_v")[0].split("_")[1])
             else:
                 fid = int(base.split("_")[1])
-            counts[fid] += 1
-    complete = sorted(fid for fid, c in counts.items() if c >= required_vars)
+            img_counts[fid] += 1
+
+    mask_counts = Counter()
+    if os.path.isdir(mask_dir):
+        for f in os.listdir(mask_dir):
+            if f.startswith("frame_") and f.endswith(".png"):
+                base = f.replace(".png", "")
+                if "_v" in base:
+                    fid = int(base.split("_v")[0].split("_")[1])
+                else:
+                    fid = int(base.split("_")[1])
+                mask_counts[fid] += 1
+    yolo_counts = Counter()
+    if os.path.isdir(yolo_dir):
+        for f in os.listdir(yolo_dir):
+            if f.startswith("frame_") and f.endswith(".txt"):
+                base = f.replace(".txt", "")
+                if "_v" in base:
+                    fid = int(base.split("_v")[0].split("_")[1])
+                else:
+                    fid = int(base.split("_")[1])
+                yolo_counts[fid] += 1
+
+    complete = sorted(fid for fid, c in img_counts.items()
+                      if c >= required_vars
+                      and mask_counts.get(fid, 0) >= required_vars
+                      and yolo_counts.get(fid, 0) >= required_vars)
     return complete[-1] if complete else None
 
 
@@ -114,10 +148,17 @@ def run_sub_batch(tag, start, end, stride, model_scale, sat_class_id, fbx_path, 
     cmd = [BLENDER, "-b", "-P",
            os.path.join(PROJECT, "blender", "render_scene.py"),
            "--"] + args
-    result = subprocess.run(cmd, cwd=PROJECT,
-                            capture_output=True, text=True,
-                            encoding='utf-8', errors='replace',
-                            timeout=7200)
+    try:
+        result = subprocess.run(cmd, cwd=PROJECT,
+                                capture_output=True, text=True,
+                                encoding='utf-8', errors='replace',
+                                timeout=BATCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # Blender was killed mid-batch. Completed frames are valid —
+        # the resume logic picks up from them on the next run.
+        print(f"\n  TIMEOUT after {BATCH_TIMEOUT_S}s (partial frames saved, "
+              f"rerun to resume)")
+        return False
     if result.returncode != 0:
         print(f"\n  ERROR: {result.stderr[-500:]}")
         return False

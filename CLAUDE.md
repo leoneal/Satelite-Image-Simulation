@@ -44,11 +44,13 @@ docs/stk_basics.md          STK 新手教程
 - 134 颗卫星 3ds Max 模型批量转 FBX + 纹理完备性检查（39 颗完备，报告见 docs/134卫星模型纹理检查报告.md）
 - v2.0 管线就绪：10 颗重点卫星选定、FBX 纹理加载、5 类部件标注流程验证（Beidou 完成）
 
-### v2.0 数据集（进行中）
-- 10 颗卫星 × 200 帧 × 15 扩增（5 姿态 × 3 光照）= 30,000 张
-- 帧范围：<70km = 172020–190592 (stride 277, ~68 帧)；70–250km = 136787–172019 + 190593–225823 (stride 503, ~71+71 帧)
-- 输出：`dataset/v2.0/<sat_name>/{images,annotations}/`，标注含 COCO/YOLO/Pose/instance_masks
-- 渲染入口：`tools/render_loop_v2.py`（自动断点续传、自动检测 .blend）
+### v2.0 数据集（已交付 13 颗）
+- 13 颗卫星（12 新模型 + DSP）× 210 帧 × 15 扩增（5 姿态 × 3 光照角度 + 强度 60-200 随机）= 40,950 张
+- 帧范围：<70km = 172020–190592 (stride 131, 142 帧)；70–250km = 136787–172019 + 190593–225823 (stride 1040, 34+34 帧)
+- 输出：`E:/sat_dataset/v2.0/<sat_name>/{images,annotations}/`，标注含 COCO/YOLO/Pose/instance_masks/factors CSV
+- 渲染入口：`tools/render_loop_v2.py`（自动断点续传、自动检测 .blend、标注完整性检查）
+- factors CSV 后补工具：`tools/gen_factors_csv.py`（确定性种子复现能量值）
+- COCO 修复工具：`blender/regenerate_coco.py`（mask 通道重渲染修复丢失的批次 COCO；×50 PNG 值 ≥6 封顶丢失类别，不能从 PNG 重建）
 
 ### 手动标注 .blend 约定（v2.0 5 类部件）
 - 用户手动标注后的 .blend 一律存 `output/blend_files/<name>.blend`（渲染循环自动检测）

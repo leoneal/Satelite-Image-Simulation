@@ -100,9 +100,15 @@ def main(mask_dir, out_dir, val_stride=5, legacy=False):
                 if os.path.basename(fp) != 'no_starfield':  # skip old batch archive
                     collect(fp)
             elif f.startswith('frame_') and f.endswith('.png'):
-                # Extract frame number: frame_XXXXX.png -> XXXXX (variable length)
-                n = int(re.match(r'frame_(\d+)\.png$', f).group(1))
-                mask_files.append((n, fp, f))
+                # Extract frame id: frame_XXXXX.png or frame_XXXXX_vNNN.png
+                # Variation files get unique image ids (frame*1000 + variation),
+                # matching render_scene.py's var_frame_id convention.
+                m = re.match(r'frame_(\d+)(?:_v(\d+))?\.png$', f)
+                if not m:
+                    continue
+                base = int(m.group(1))
+                var = int(m.group(2)) if m.group(2) else 0
+                mask_files.append((base * 1000 + var, fp, f))
     collect(mask_dir)
     mask_files.sort()
     print(f"Found {len(mask_files)} mask files under {mask_dir}")
@@ -126,13 +132,20 @@ def main(mask_dir, out_dir, val_stride=5, legacy=False):
             "height": int(h),
         })
 
-        for pixval in range(1, 256):
+        # Only process pixel values actually present in the mask
+        # (naive 1..255 loop costs 256 full-image comparisons per image)
+        for pixval in np.unique(mask):
+            pixval = int(pixval)
+            if pixval == 0:
+                continue
             cat_id = pixel_to_category(pixval, legacy=legacy)
             if cat_id is None:
                 continue
             binary = (mask == pixval)
             area = int(binary.sum())
-            if area == 0:
+            # Same area filter as render-time mask_to_annotations
+            min_area = 2 if cat_id in (3, 4, 5) else 30
+            if area < min_area:
                 continue
             ys, xs = np.nonzero(binary)
             x0, x1 = int(xs.min()), int(xs.max())

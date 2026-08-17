@@ -347,6 +347,10 @@ def _load_fbx_textures(fbx_path, meshes):
         return any(kw in os.path.splitext(fname)[0].lower() for kw in keywords)
 
     for obj in meshes:
+        # Meshes without a UV map cannot sample textures — use solid color
+        if not obj.data.uv_layers.active:
+            _add_component_material(obj, _classify_part(obj)[0])
+            continue
         o_name = obj.get('fbx_original_name', obj.name).lower()
 
         def _mesh_has(*keywords):
@@ -1243,7 +1247,12 @@ def mask_to_annotations(mask, frame_id, image_filename, ann_id_start):
         if 150 <= nearest <= 199: return 4
         if 200 <= nearest <= 249: return 5
         return None
-    for pixval in range(1, 256):
+    # Only process pixel values actually present (naive 1..255 loop costs
+    # 256 full-image comparisons per mask — ~4s each)
+    for pixval in np.unique(mask):
+        pixval = int(pixval)
+        if pixval == 0:
+            continue
         cat_id = pixel_to_category(pixval)
         if cat_id is None:
             continue

@@ -35,21 +35,33 @@ docs/开发手册.md            项目完整开发手册（架构、命令、踩
 docs/stk_basics.md          STK 新手教程
 ```
 
-## 当前进度（2026-08-04）
+## 当前进度（2026-08-22）
 
 ### 已完成
 - 阶段 1-3：STK 连接、场景构建、星历导出
 - 阶段 4 核心渲染：**DSP 卫星模型 segA/B/C 三个子段全部渲染完成**
-- v1.1 数据集（15,000 张扩增）渲染中/已交付
+- v1.1 数据集（15,000 张扩增）已交付
 - 134 颗卫星 3ds Max 模型批量转 FBX + 纹理完备性检查（39 颗完备，报告见 docs/134卫星模型纹理检查报告.md）
-- v2.0 管线就绪：10 颗重点卫星选定、FBX 纹理加载、5 类部件标注流程验证（Beidou 完成）
+- v2.0 数据集（13 颗，40,950 张）已交付
+- **v2.1 数据集（14 颗，44,100 张）已交付**
 
-### v2.0 数据集（已交付 13 颗）
+### v2.1 数据集（已交付 14 颗）★ 当前版本
+- 14 颗卫星 × 63 帧 × 50 变体（5 姿态 × 10 光照角度）= 44,100 张
+- **灰度图**（Cycles GPU 渲染下节点组 compositor 静默失效 → Python 后处理转灰度 `_convert_to_grayscale`）
+- **太阳常数光照**：基线 1361 W/m²（GEO 适用），强度范围 950-1770 随机，曝光 EV -3.5 补偿
+- 光照角度：1 真实 + 9 随机（0-180°，确定性种子）；材质：roughness 0.65 / metallic 0.05（压制高光截断）/ emission 12（负 EV 下暗部可见）
+- YOLO 新增卫星类别（19=导航/20=光学遥感/21=微波/22=通信）
+- factors CSV：`sun_irradiance_w_m2`（量纲明确）+ `fov_deg` 列
+- 帧范围：<70km = 172020–190592 (stride 450, 42 帧)；70–250km = 136787–172019 + 190593–225823 (stride 3400/3600, 11+10 帧)
+- 输出：`E:/sat_dataset/v2.1/<sat_name>/{images,annotations}/`
+- 渲染入口：`tools/render_loop_v2_1.py`（REQUIRED_VARS=50，SUB_BATCH_SIZE=15）
+
+### v2.0 数据集（已交付 13 颗，上一版本）
 - 13 颗卫星（12 新模型 + DSP）× 210 帧 × 15 扩增（5 姿态 × 3 光照角度 + 强度 60-200 随机）= 40,950 张
 - 帧范围：<70km = 172020–190592 (stride 131, 142 帧)；70–250km = 136787–172019 + 190593–225823 (stride 1040, 34+34 帧)
 - 输出：`E:/sat_dataset/v2.0/<sat_name>/{images,annotations}/`，标注含 COCO/YOLO/Pose/instance_masks/factors CSV
 - 渲染入口：`tools/render_loop_v2.py`（自动断点续传、自动检测 .blend、标注完整性检查）
-- factors CSV 后补工具：`tools/gen_factors_csv.py`（确定性种子复现能量值）
+- factors CSV 后补工具：`tools/gen_factors_csv.py`（确定性种子复现能量值，--version 支持 v2.0/v2.1 时序）
 - COCO 修复工具：`blender/regenerate_coco.py`（mask 通道重渲染修复丢失的批次 COCO；×50 PNG 值 ≥6 封顶丢失类别，不能从 PNG 重建）
 
 ### 手动标注 .blend 约定（v2.0 5 类部件）
@@ -85,8 +97,12 @@ docs/stk_basics.md          STK 新手教程
 - `--camera_mode`：`track`（追踪目标）或 `stare`（固定 ECI 指向，segA/C 使用）
 - `--no_annotations`：跳过标注生成（segA/C 使用，目标为亚像素点）
 - `--blend_path`：用户标注 .blend 路径（优先于 FBX）
-- `--output_root`：输出根目录覆盖（v2.0 用 dataset/v2.0/<sat_name>）
-- `--sat_class_id`：整星检测 YOLO 类别（v2.0 用 5-14，避开部件类 0-4）
+- `--output_root`：输出根目录覆盖（v2.x 用 E:/sat_dataset/v2.x/<sat_name>）
+- `--sat_class_id`：整星检测 YOLO 类别（卫星型号 5-18，避开部件类 0-4）
+- `--sat_category_id`：卫星类别 YOLO 标签（v2.1：19=导航/20=光学遥感/21=微波/22=通信）
+- `--sun_phase_count`：光照角度变体数（v2.1：10 = 1 真实 + 9 随机 0-180°）
+- `--sun_energy_range`：太阳辐照度范围 W/m²（v2.1 基线太阳常数 1361，扩增 950-1770）
+- `--exposure_ev`：曝光补偿 EV（v2.1 用 -3.5 平衡太阳常数亮度）
 
 ## 关键约束（踩坑记录，必须遵守）
 
@@ -159,13 +175,17 @@ earth.location = -obs_pos          # 地球在 ~42164 km（精度需求低）
 - **Operator 需要对象被选中才能生效**：`bpy.ops.object.parent_clear()` 和 `bpy.ops.object.transform_apply()` 操作的是**选中的对象**，仅设 `active` 不够，必须 `obj.select_set(True)`。
 - `bpy.ops.mesh.bisect()` **无 `fill` 参数**（Blender 5.2）。
 - `bpy.data.libraries.load()` 的相对路径在 Windows 上可能解析到盘符根目录（C:\...）——**必须先 `os.path.abspath()`**。`bpy.ops.import_scene.fbx` 无此问题。
+- **节点组 compositor 在 GPU 渲染下静默失效**（Blender 5.2 -b 模式）：`compositing_node_group` 的 RGBToBW 在 CPU 渲染生效、GPU 渲染被忽略——v2.1 灰度改为 Python 后处理（`_convert_to_grayscale`，渲染后加载 PNG 转亮度再存回）。
+- **负曝光会压暗 emission 可见度**：EV -3.5 下 emission 强度需 ×12 才能维持暗部可见性；顺光面漫反射本身接近 Filmic 饱和区，EV 需 -3.5 才不截断。
 
-### 标注管线关键修复（v2.0）
+### 标注管线关键修复（v2.0/v2.1）
 - **Mask 渲染必须隐藏星幕和地球**（`assign_mask_materials` 隐藏所有非卫星 mesh 并记录原可见性，`restore_materials` 恢复）——否则恒星像素污染 mask 和 COCO 标注。
 - **Mask PNG 值 ×50 保存**（1→50, 2→100, ...，cap 250）——原始值 1-5 在 8-bit 灰度图上视觉不可见。`build_coco.py` 解码用 `pix//50`，旧 v1.0 数据重建加 `--legacy`。
+- **Mask 渲染需隔离后处理**：曝光（exposure）会影响 EXR 值 → `render_mask_image` 临时置 exposure=0 再恢复。
 - **FBX 太阳翼需拆分**：3ds Max 模型把左右两翼存在同一 mesh（顶点跨 x=0），front/back 面是同一块板的两个 co-located mesh。`_split_panel_meshes()` 在居中后用 bisect 按 x=0 切分，并按 (名字去 front/back 后缀, 左/右) 分组——正反面共享实例 ID。
 - **FBX 纹理匹配**：emission Color 必须连到纹理（否则白色洗掉纹理）；`os.listdir` 目录路径必须 `abspath`（中文相对路径静默失败）。
-- **YOLO 整星类别 id 用 5-14**，避开部件类 0-4（body/panel/phased/reflector/tripod）。
+- **YOLO 类别体系**：部件 0-4（body/panel/phased/reflector/tripod）、卫星型号 5-18、卫星类别 19-22（导航/光学遥感/微波/通信）。
+- **太阳光照方向**：sun lamp +Z 朝太阳位置（光沿 -Z 发射）；"背光"是光照角度≈0°（太阳在相机后），"顺光"≈180°（太阳在目标后）——v2.0 角度 115° 的图实际是侧光。
 
 ### 场景尺度
 - Blender 场景统一用 **km**（m×0.001），相机 clip_start=0.01 km (10m), clip_end=200000 km。

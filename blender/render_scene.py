@@ -64,14 +64,23 @@ def parse_args():
                         help='Max random attitude perturbation in degrees (uniform cone)')
     parser.add_argument('--sun_phase_offsets', type=str, default='',
                         help='Comma-separated sun phase offsets in degrees (e.g. "30,90,150")')
+    parser.add_argument('--sun_phase_count', type=int, default=None,
+                        help='Number of sun angle variants: 1 true angle + (N-1) random '
+                             'samples in [0,180] deg per frame (v2.1 mode)')
     parser.add_argument('--sun_energy_range', type=str, default='',
-                        help='Sun energy range "min,max" for random sampling (e.g. "40,120")')
+                        help='Sun irradiance range "min,max" W/m2 for random sampling '
+                             '(default baseline: solar constant 1361)')
+    parser.add_argument('--exposure_ev', type=float, default=0.0,
+                        help='Film exposure compensation in EV (negative darkens)')
     parser.add_argument('--render_device', type=str, default='gpu',
                         choices=['gpu', 'cpu'],
                         help='Render device: gpu (OptiX) or cpu')
     parser.add_argument('--sat_class_id', type=int, default=None,
                         help='Satellite model class ID for YOLO detection label '
                              '(0-based, added as extra line per frame)')
+    parser.add_argument('--sat_category_id', type=int, default=None,
+                        help='Satellite category class ID for YOLO (19=nav, 20=opt, '
+                             '21=mic, 22=com; whole-satellite bbox)')
     parser.add_argument('--fbx_path', type=str, default=None,
                         help='Path to FBX model file (overrides default)')
     parser.add_argument('--blend_path', type=str, default=None,
@@ -232,12 +241,15 @@ def _add_component_material(obj, comp_type):
 
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.inputs['Base Color'].default_value = (*color, 1.0)
-    bsdf.inputs['Roughness'].default_value = 0.4
-    bsdf.inputs['Metallic'].default_value = 0.3
+    # v2.1: tame specular glints at solar-constant irradiance
+    bsdf.inputs['Roughness'].default_value = 0.65
+    bsdf.inputs['Metallic'].default_value = 0.05
 
     emit = nodes.new('ShaderNodeEmission')
     emit.inputs['Color'].default_value = (*color, 1.0)
-    emit.inputs['Strength'].default_value = 1.0
+    # v2.1: negative film exposure (EV -2.5) darkens the emission floor;
+    # boost strength so shadowed satellite views stay visible.
+    emit.inputs["Strength"].default_value = 12.0
 
     mix = nodes.new('ShaderNodeMixShader')
     mix.inputs['Fac'].default_value = 0.05  # 5% emission, barely visible
@@ -391,11 +403,15 @@ def _load_fbx_textures(fbx_path, meshes):
         tex_node.interpolation = 'Linear'
 
         bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-        bsdf.inputs['Roughness'].default_value = 0.4
-        bsdf.inputs['Metallic'].default_value = 0.3
+        # v2.1: high roughness / low metallic tames specular glints that
+        # clip at solar-constant irradiance (1361+ W/m2)
+        bsdf.inputs['Roughness'].default_value = 0.65
+        bsdf.inputs['Metallic'].default_value = 0.05
 
         emit = nodes.new('ShaderNodeEmission')
-        emit.inputs['Strength'].default_value = 1.0
+        # v2.1: negative film exposure (EV -2.5) darkens the emission floor;
+        # boost strength so shadowed satellite views stay visible.
+        emit.inputs["Strength"].default_value = 12.0
 
         mix = nodes.new('ShaderNodeMixShader')
         mix.inputs['Fac'].default_value = 0.30  # 30% emission — 6× DSP but preserves BSDF lighting
@@ -913,6 +929,10 @@ def setup_render(samples, render_device='gpu'):
 
     # Enable object index pass for segmentation masks
     scene.view_layers['ViewLayer'].use_pass_object_index = True
+    # NOTE: no grayscale compositor here — Blender 5.2's node-group
+    # compositor silently no-ops on GPU renders in headless mode.
+    # Grayscale conversion happens in Python after each beauty render
+    # (_convert_to_grayscale).
 
 
 # ============================================================
@@ -1148,6 +1168,12 @@ def render_mask_image(resolution, samples_backup, tmp_exr_path):
     scene = bpy.context.scene
     scene.cycles.samples = 1
 
+    # Isolate the mask pass from post-processing: film exposure would scale
+    # the EXR values and corrupt the instance pixel encoding. Neutralize
+    # during the mask render, restore afterwards.
+    prev_exposure = scene.view_settings.exposure
+    scene.view_settings.exposure = 0.0
+
     # Render to temp EXR (linear floats)
     prev_fmt = scene.render.image_settings.file_format
     prev_depth = scene.render.image_settings.color_depth
@@ -1158,6 +1184,7 @@ def render_mask_image(resolution, samples_backup, tmp_exr_path):
     scene.render.image_settings.file_format = prev_fmt
     scene.render.image_settings.color_depth = prev_depth
     scene.cycles.samples = samples_backup
+    scene.view_settings.exposure = prev_exposure
 
     img = bpy.data.images.load(tmp_exr_path)
     w, h = img.size
@@ -1208,6 +1235,25 @@ def save_mask_png(mask, filepath, scale=50):
     iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff)
     with open(filepath, 'wb') as f:
         f.write(sig + ihdr + idat + iend)
+
+
+def _convert_to_grayscale(png_path):
+    """Convert a rendered PNG to grayscale in place (luminance weighting).
+    Blender 5.2's node-group compositor silently no-ops on GPU renders in
+    headless mode, so v2.1 grayscale happens in Python after each render."""
+    img = bpy.data.images.load(png_path)
+    w, h = img.size
+    pixels = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(pixels)
+    arr = pixels.reshape(h, w, 4)
+    lum = (0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1]
+           + 0.0722 * arr[:, :, 2])
+    arr[:, :, 0] = lum
+    arr[:, :, 1] = lum
+    arr[:, :, 2] = lum
+    img.pixels.foreach_set(arr.reshape(-1))
+    img.save()
+    bpy.data.images.remove(img)
 
 
 def rle_encode(binary_mask):
@@ -1396,38 +1442,45 @@ def main():
     num_attitude_vars = max(1, args.frame_variations)
     jitter_deg = args.attitude_jitter_deg
 
-    # Parse sun phase offsets (deduplicated, 0.0 always present as baseline)
-    sun_offsets = [0.0]
-    if args.sun_phase_offsets:
-        for x in args.sun_phase_offsets.split(','):
-            val = float(x.strip())
+    # Sun angle variants: v2.1 mode (--sun_phase_count N) = 1 true physical
+    # angle + (N-1) random samples in [0,180] per frame (deterministic seeds).
+    # Legacy mode (--sun_phase_offsets) = fixed offset list.
+    if args.sun_phase_count:
+        num_sun_vars = args.sun_phase_count
+        sun_mode = 'random'
+    else:
+        sun_offsets = [0.0]
+        for x in (args.sun_phase_offsets or '').split(','):
+            try:
+                val = float(x.strip())
+            except ValueError:
+                continue
             if val != 0.0 and val not in sun_offsets:
                 sun_offsets.append(val)
+        num_sun_vars = len(sun_offsets)
+        sun_mode = 'fixed'
 
-    # Parse sun energy range
-    sun_energy_min, sun_energy_max = 200.0, 200.0  # default
+    # Sun irradiance in W/m2 (Cycles Sun Strength is physically irradiance).
+    # Default baseline: solar constant 1361 W/m2 (valid at GEO).
+    sun_irr_min, sun_irr_max = 1361.0, 1361.0
     if args.sun_energy_range:
         parts = [x.strip() for x in args.sun_energy_range.split(',')]
         if len(parts) == 2:
-            sun_energy_min, sun_energy_max = float(parts[0]), float(parts[1])
+            sun_irr_min, sun_irr_max = float(parts[0]), float(parts[1])
 
-    # Build flat list of (attitude_var_idx, sun_offset_deg) combinations
-    # v000 = (0, 0.0) = original attitude + original sun
-    combinations = [(0, 0.0)]
-    for av in range(num_attitude_vars):
-        for so in sun_offsets:
-            if av == 0 and so == 0.0:
-                continue
-            combinations.append((av, so))
-    total_combos = len(combinations)
+    total_combos = num_attitude_vars * num_sun_vars
+
+    # Film exposure compensation (v2.1: negative EV balances 1361 W/m2)
+    bpy.context.scene.view_settings.exposure = args.exposure_ev
 
     aug_info = f"{num_attitude_vars} att vars"
     if jitter_deg > 0:
         aug_info += f", jitter={jitter_deg}°"
-    if len(sun_offsets) > 1:
-        aug_info += f", {len(sun_offsets)} sun phases ({args.sun_phase_offsets})"
-    if args.sun_energy_range:
-        aug_info += f", sun energy {sun_energy_min}-{sun_energy_max}"
+    if sun_mode == 'random':
+        aug_info += f", {num_sun_vars} sun angles (1 true + {num_sun_vars - 1} random 0-180°)"
+    elif num_sun_vars > 1:
+        aug_info += f", {num_sun_vars} sun phases ({args.sun_phase_offsets})"
+    aug_info += f", irradiance {sun_irr_min}-{sun_irr_max} W/m2, exposure {args.exposure_ev} EV"
     print(f"\n--- Rendering ({total_combos} combinations/frame: {aug_info}) ---")
 
     for frame_idx, actual_idx in enumerate(frame_indices):
@@ -1436,7 +1489,10 @@ def main():
         tgt_row = tgt_data[actual_idx]
         sun_row = sun_data[actual_idx] if actual_idx < len(sun_data) else sun_data[0]
 
-        for combo_idx, (av, so) in enumerate(combinations):
+        for combo_idx in range(total_combos):
+            av = combo_idx // num_sun_vars
+            si = combo_idx % num_sun_vars
+
             # Attitude perturbation
             if jitter_deg > 0.0 and av > 0:
                 random.seed(actual_idx * 1000 + av)
@@ -1444,15 +1500,22 @@ def main():
             else:
                 perturb = None
 
-            # Sun phase offset (0.0 = original)
-            sun_offset = so
-
-            # Random sun energy within range
-            if sun_energy_min != sun_energy_max:
-                random.seed(actual_idx * 1000 + combo_idx + 9999)
-                sun_light.data.energy = random.uniform(sun_energy_min, sun_energy_max)
+            # Sun phase angle: si 0 = true angle, others random [0,180]
+            if sun_mode == 'random':
+                if si == 0:
+                    sun_offset = 0.0
+                else:
+                    random.seed(actual_idx * 10000 + si + 777)
+                    sun_offset = random.uniform(0.0, 180.0)
             else:
-                sun_light.data.energy = 200.0
+                sun_offset = sun_offsets[si]
+
+            # Sun irradiance (W/m2)
+            if sun_irr_min != sun_irr_max:
+                random.seed(actual_idx * 1000 + combo_idx + 9999)
+                sun_light.data.energy = random.uniform(sun_irr_min, sun_irr_max)
+            else:
+                sun_light.data.energy = sun_irr_min
 
             # Unique frame ID for annotations
             var_frame_id = actual_idx * 1000 + combo_idx
@@ -1468,10 +1531,11 @@ def main():
                 sun_light, sun_target, earth,
                 perturb_quat=perturb, sun_phase_offset=sun_offset)
 
-            # 1. Beauty render (RGB)
+            # 1. Beauty render (RGB), then grayscale conversion (v2.1)
             output_path = os.path.join(image_dir, f'{fname}.png')
             bpy.context.scene.render.filepath = output_path
             bpy.ops.render.render(write_still=True)
+            _convert_to_grayscale(output_path)
 
             # 0. Record influencing factors (per-image conditions annotation)
             factors_rows.append({
@@ -1480,7 +1544,8 @@ def main():
                 'variation': combo_idx,
                 'distance_km': f'{dist_km:.3f}',
                 'sun_phase_angle_deg': f'{sun_angle_deg:.2f}',
-                'sun_energy': f'{sun_light.data.energy:.1f}',
+                'sun_irradiance_w_m2': f'{sun_light.data.energy:.1f}',
+                'fov_deg': f'{fov_deg:.3f}',
             })
 
             if enable_annotations:
@@ -1499,16 +1564,21 @@ def main():
                 coco_images.append(img_entry)
                 coco_annotations.extend(ann_entries)
 
-                # Add satellite model class label (full satellite bbox)
-                if args.sat_class_id is not None:
+                # Whole-satellite bbox (shared by category + model class labels)
+                if args.sat_class_id is not None or args.sat_category_id is not None:
                     h, w = mask.shape
                     ys, xs = np.nonzero(mask)
                     if len(xs) > 0:
                         x0, x1 = int(xs.min()), int(xs.max())
                         y0, y1 = int(ys.min()), int(ys.max())
                         bw, bh = x1 - x0 + 1, y1 - y0 + 1
-                        yolo_lines.insert(0,
-                            f"{args.sat_class_id} {(x0 + bw/2)/w:.6f} {(y0 + bh/2)/h:.6f} {bw/w:.6f} {bh/h:.6f}")
+                        sat_line = (f"{(x0 + bw/2)/w:.6f} {(y0 + bh/2)/h:.6f} "
+                                    f"{bw/w:.6f} {bh/h:.6f}")
+                        # Model class label, then category label at the top
+                        if args.sat_class_id is not None:
+                            yolo_lines.insert(0, f"{args.sat_class_id} {sat_line}")
+                        if args.sat_category_id is not None:
+                            yolo_lines.insert(0, f"{args.sat_category_id} {sat_line}")
 
                 with open(os.path.join(yolo_dir, f'{fname}.txt'), 'w') as f:
                     f.write('\n'.join(yolo_lines) + ('\n' if yolo_lines else ''))
@@ -1517,8 +1587,8 @@ def main():
                 write_pose_file(pose_dir, actual_idx, tgt_row, obs_row,
                                 perturb_quat=perturb, var_idx=combo_idx)
 
-        # Restore sun energy after all variations for this frame
-        sun_light.data.energy = 200.0
+        # Restore sun irradiance after all variations for this frame
+        sun_light.data.energy = sun_irr_min
 
         # Progress per original frame
         if frame_idx % 10 == 0 or frame_idx == num_render - 1:
@@ -1535,7 +1605,8 @@ def main():
         with open(factors_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
                 'filename', 'frame_id', 'variation',
-                'distance_km', 'sun_phase_angle_deg', 'sun_energy'])
+                'distance_km', 'sun_phase_angle_deg',
+                'sun_irradiance_w_m2', 'fov_deg'])
             writer.writeheader()
             writer.writerows(factors_rows)
         print(f"Factors CSV:          {factors_path} ({len(factors_rows)} rows)")

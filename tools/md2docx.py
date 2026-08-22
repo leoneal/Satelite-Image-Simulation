@@ -247,6 +247,28 @@ def convert_md_to_docx(md_path, docx_path):
             p.paragraph_format.space_after = Pt(2)
             continue
 
+        # Standalone image: ![alt](path) — embed centered with caption
+        img_match = re.match(r'^!\[(.+?)\]\((.+?)\)$', stripped)
+        if img_match:
+            alt = img_match.group(1)
+            rel = img_match.group(2)
+            img_path = os.path.join(os.path.dirname(md_path),
+                                    rel.replace('/', os.sep))
+            if os.path.exists(img_path):
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = p.add_run()
+                run.add_picture(img_path, width=Cm(15.5))
+                cap = doc.add_paragraph()
+                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cap_run = cap.add_run(alt)
+                cap_run.font.size = Pt(9)
+                cap_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+            else:
+                print(f"WARNING: image not found: {img_path}")
+            i += 1
+            continue
+
         # Blockquote
         if stripped.startswith('>'):
             bq_lines = []
